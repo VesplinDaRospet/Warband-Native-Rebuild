@@ -44,7 +44,10 @@ The following are strictly prohibited and will be removed or blocked immediately
 - Using this repository to facilitate piracy, license circumvention, or IP infringement.
 
 Violations will result in immediate content removal and permanent bans for repeat or serious offenders.
-The maintainer reserves the right to suspend or terminate the project, or delete the repository, if compliance risks cannot be contained.
+The maintainer may suspend, terminate the project, or delete this repository **at any time, with or without reason or notice**.
+
+This repository is an independent project with no affiliation with or endorsement from TaleWorlds Entertainment.
+The author is not responsible for any third-party use, modification, or fork of this repository.
 
 Violators will be removed. The project will not be held hostage by bad actors.
 
@@ -170,7 +173,10 @@ and all applicable laws. The author claims no endorsement by or affiliation with
 - 利用本仓库协助盗版、绕过授权或侵犯知识产权。
 
 违规内容将被立即移除；重复或严重违规者永久封禁。
-若合规风险无法控制，维护者保留暂停、终止项目或删除仓库的权利。
+维护者可随时、以任何理由或无需任何理由，暂停、终止本项目或删除本仓库，无需另行通知。
+
+本仓库是与 TaleWorlds Entertainment 无任何关联、亦未获其背书的独立项目。
+作者不对任何第三方对本仓库的使用、修改或 fork 承担责任。
 
 违规者将被清除。本项目不会向恶意行为者妥协。
 
