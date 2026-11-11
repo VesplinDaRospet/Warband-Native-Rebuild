@@ -53,7 +53,7 @@ struct App {
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipeline pipeSky = VK_NULL_HANDLE;
-    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; };
+    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; };
     std::vector<Obj> objs;
     std::vector<VkImageView> texViews;
     std::vector<std::string> texNames;
@@ -115,13 +115,19 @@ static void camFrame(float cx, float cz, float eyeH, float yaw, float pitch, flo
     target[1] = cz + fhz*103.f;
     target[2] = eyeH + tanf(pitch)*103.f;
 }
-static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const float target[3]) {
+static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const float target[3], const float* model16=nullptr) {
     std::vector<float> V, P;
     // 渲染坐标：x=世界x, y=世界z(南北), z=世界y(高度)；up=高度轴
     lookAt(V, eye[0], eye[1], eye[2], target[0], target[1], target[2]);
     perspective(P, 1.0f, 1280.0f/720.0f, 0.5f, 800.0f);
     pc.resize(24, 0.f);
-    matMul44(P.data(), V.data(), pc); // pc[0..15] = mvp
+    if (model16) {
+        std::vector<float> VM;
+        matMul44(V.data(), model16, VM);
+        matMul44(P.data(), VM.data(), pc);
+    } else {
+        matMul44(P.data(), V.data(), pc); // pc[0..15] = mvp
+    }
     pc[16] = eye[0]; pc[17] = eye[1]; pc[18] = eye[2];
     pc[20] = 70.f; pc[21] = 300.f;    // 雾起点/终点（世界距离）
 }
@@ -467,7 +473,9 @@ static std::map<std::string, std::vector<brf::Mesh>> g_meshGroups;
 static std::map<std::string, std::string> g_materialDiffuse;
 static sco::Terrain g_terrain;
 
-struct Cam { float x=0, z=0, h=55.f, yaw=0.f, pitch=-0.32f; };
+struct Cam { float yaw=0.f, height=5.f, dist=9.f; };          // 第三人称相机：绕角色的水平角/高度/距离
+struct Char { float x=0, z=0, yaw=0.f; };
+static Char g_char;
 static float terrainHeightAt(float x, float z) {
     if (g_terrain.width < 2 || g_terrain.height < 2 || g_terrain.elevation.empty()) return 0.f;
     float fi = x/2.f, fj = z/2.f; // cell=2m，原点(0,0)
@@ -484,26 +492,43 @@ static float terrainHeightAt(float x, float z) {
     float h1 = e(i0,j1)*(1-fx) + e(i1,j1)*fx;
     return h0*(1-fz) + h1*fz;
 }
-static bool updateCam(Cam& c, float dt) {
-    float sx=0, sz=0, dh=0, dy=0, dp=0;
+// 第三人称相机 eye/target（渲染坐标）
+static void playerFrame(const Char& ch, const Cam& cam, float eye[3], float target[3]) {
+    float a = cam.yaw;
+    eye[0] = ch.x + sinf(a)*cam.dist;
+    eye[1] = ch.z + cosf(a)*cam.dist;
+    eye[2] = terrainHeightAt(eye[0], eye[1]) + cam.height;
+    target[0] = ch.x; target[1] = ch.z; target[2] = terrainHeightAt(ch.x, ch.z) + 1.5f;
+}
+// 更新角色移动与第三人称相机参数；返回是否有输入
+static bool updatePlayer(Cam& cam, float dt) {
+    float sx=0, sz=0, dy=0, dp=0, dd=0;
     auto k = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
     if (k('W')) sz += 1; if (k('S')) sz -= 1;
     if (k('D')) sx += 1; if (k('A')) sx -= 1;
-    if (k('E')) dh += 1; if (k('Q')) dh -= 1;
     if (k(VK_LEFT)) dy += 1; if (k(VK_RIGHT)) dy -= 1;
     if (k(VK_UP)) dp += 1; if (k(VK_DOWN)) dp -= 1;
-    if (!(sx||sz||dh||dy||dp)) return false;
-    float speed = (k(VK_SHIFT) ? 60.f : 18.f) * dt;
-    float fx = -sinf(c.yaw), fz = -cosf(c.yaw);
-    float rx = cosf(c.yaw), rz = -sinf(c.yaw);
-    c.x += (fx*sz + rx*sx)*speed;
-    c.z += (fz*sz + rz*sx)*speed;
-    c.h += dh*speed*0.5f;
-    c.yaw += dy*1.4f*dt;
-    c.pitch = std::max(-1.2f, std::min(0.05f, c.pitch + dp*0.9f*dt));
-    float th = terrainHeightAt(c.x, c.z);
-    if (c.h < th + 1.5f) c.h = th + 1.5f; // 不穿地
-    if (c.h > th + 80.f) c.h = th + 80.f;
+    if (k('E')) dd -= 1; if (k('Q')) dd += 1;   // QE 拉近/拉远相机
+    cam.yaw += dy*1.6f*dt;
+    cam.height = std::max(2.0f, std::min(20.f, cam.height + dp*6.f*dt));
+    cam.dist = std::max(4.0f, std::min(30.f, cam.dist + dd*10.f*dt));
+    if (!(sx||sz||dy||dp||dd)) return false;
+    float speed = (k(VK_SHIFT) ? 12.f : 5.5f) * dt;
+    // 以相机方向为基准：相机看向角色，前方 = 从相机到角色的水平方向
+    float fx = -sinf(cam.yaw), fz = -cosf(cam.yaw);
+    float rx = cosf(cam.yaw), rz = -sinf(cam.yaw);
+    float mx = fx*sz + rx*sx;
+    float mz = fz*sz + rz*sx;
+    float ml = sqrtf(mx*mx + mz*mz);
+    if (ml > 1e-6f) {
+        g_char.x += mx/ml * speed;
+        g_char.z += mz/ml * speed;
+        float targetYaw = atan2f(-mx/ml, -mz/ml); // 模型前方 +y 的朝向
+        float dyaw = targetYaw - g_char.yaw;
+        while (dyaw > 3.14159f) dyaw -= 6.28318f;
+        while (dyaw < -3.14159f) dyaw += 6.28318f;
+        g_char.yaw += dyaw * std::min(1.f, 8.f*dt);
+    }
     return true;
 }
 
@@ -669,6 +694,58 @@ static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<Groun
     for (int li=0; li<=10; li++) if (!idxs[li].empty()) std::fprintf(stderr, " L%d:%zu", li, idxs[li].size()/6);
     std::fprintf(stderr, "\n");
 }
+// 简易人形占位角色：程序化 box 组成（脚在 z=0，头在 z≈1.7，前方 +y）
+static void boxPart(std::vector<float>& V, std::vector<uint32_t>& I,
+                    float x0,float x1,float y0,float y1,float z0,float z1,
+                    float r,float g,float b) {
+    uint32_t base=(uint32_t)(V.size()/11);
+    float cs[8][3]={{x0,y0,z0},{x1,y0,z0},{x1,y1,z0},{x0,y1,z0},{x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}};
+    // 6 面，法线朝外
+    const int faces[6][4]={{0,3,2,1},{4,5,6,7},{0,1,5,4},{2,3,7,6},{1,2,6,5},{0,4,7,3}};
+    const float ns[6][3]={{0,0,-1},{0,0,1},{0,-1,0},{0,1,0},{1,0,0},{-1,0,0}};
+    for (int f=0;f<6;f++) {
+        for (int q=0;q<4;q++) {
+            const float* c=cs[faces[f][q]];
+            V.push_back(c[0]); V.push_back(c[1]); V.push_back(c[2]);
+            V.push_back(r); V.push_back(g); V.push_back(b);
+            V.push_back(ns[f][0]); V.push_back(ns[f][1]); V.push_back(ns[f][2]);
+            V.push_back(0); V.push_back(0);
+        }
+        uint32_t b0=base+f*4;
+        I.push_back(b0); I.push_back(b0+2); I.push_back(b0+1);
+        I.push_back(b0); I.push_back(b0+3); I.push_back(b0+2);
+    }
+}
+static void makeCharObj(App& A) {
+    std::vector<float> V; std::vector<uint32_t> I;
+    boxPart(V,I, -0.16f,0.16f, -0.12f,0.12f, 0.0f,0.72f, 0.30f,0.22f,0.12f); // 左腿? 用一对
+    boxPart(V,I, -0.16f,0.16f, -0.12f,0.12f, 0.0f,0.72f, 0.30f,0.22f,0.12f);
+    boxPart(V,I, -0.38f,0.38f, -0.18f,0.18f, 0.66f,1.30f, 0.20f,0.34f,0.55f); // 躯干
+    boxPart(V,I, -0.24f,0.24f, -0.20f,0.20f, 1.28f,1.66f, 0.86f,0.68f,0.50f); // 头
+    boxPart(V,I, -0.52f,-0.24f, -0.12f,0.12f, 0.95f,1.32f, 0.20f,0.34f,0.55f); // 左臂
+    boxPart(V,I,  0.24f,0.52f, -0.12f,0.12f, 0.95f,1.32f, 0.20f,0.34f,0.55f); // 右臂
+    App::Obj obj;
+    obj.diffName = "snow"; // 白色贴图兜底，角色主要靠顶点色
+    auto ti = A.texIndex.find(obj.diffName);
+    obj.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
+    obj.descSet = A.texSets.empty() ? VK_NULL_HANDLE : A.texSets[obj.texSlot];
+    obj.model.assign(16, 0.f);
+    makeBuffer(A, V.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
+    upload(A, obj.vb, obj.vm, V.data(), V.size()*4);
+    obj.idxCount = (uint32_t)I.size();
+    makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
+    upload(A, obj.ib, obj.im, I.data(), obj.idxCount*4);
+    A.objs.push_back(std::move(obj));
+    std::fprintf(stderr, "占位角色 顶点=%zu 三角形=%zu\n", V.size()/11, I.size()/3);
+}
+static void setCharModel(App::Obj& o, const Char& ch) {
+    float cy = cosf(ch.yaw), sy = sinf(ch.yaw);
+    float h = terrainHeightAt(ch.x, ch.z);
+    // 列主序 model：先绕高度轴转 yaw，再平移（渲染坐标 y=世界南北）
+    float M[16] = { cy, sy, 0, 0,  -sy, cy, 0, 0,  0,0,1,0,  ch.x, ch.z, h, 1 };
+    o.model.assign(M, M+16);
+}
+
 // 原版天空穹顶：skyboxes.brf 的单位球网格，放大到远平面内并跟随相机水平位置
 static void makeSkyObj(App& A, const brf::Mesh& mesh, float cx, float cz, std::set<std::string>& needDds) {
     const float S = 380.f; // 网格半径~1.87，缩放后~710m < zf=800
@@ -822,7 +899,7 @@ static void allocCmds(App& A) {
 }
 
 static void updateAllMVP(App& A, const float eye[3], const float target[3]) {
-    for (auto& o : A.objs) computeSceneMVP(o.pc, eye, target);
+    for (auto& o : A.objs) computeSceneMVP(o.pc, eye, target, o.model.empty()?nullptr:o.model.data());
 }
 
 static void recordCmdOne(App& A, size_t img) {
@@ -892,9 +969,17 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "F: allocCmds\n");
     allocCmds(A);
-    Cam cam; cam.x = sceneCX; cam.z = sceneCZ;
+    g_char.x = sceneCX; g_char.z = sceneCZ;
+    makeCharObj(A);
+    for (auto& o : A.objs) {
+        if (!o.model.empty()) setCharModel(o, g_char);
+        auto ti = A.texIndex.find(o.diffName);
+        o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
+        o.descSet = A.texSets[o.texSlot];
+    }
+    Cam cam; // 第三人称相机：初始在角色北侧
     float eye[3], tgt[3];
-    camFrame(cam.x, cam.z, cam.h, cam.yaw, cam.pitch, eye, tgt);
+    playerFrame(g_char, cam, eye, tgt);
     updateAllMVP(A, eye, tgt);
     for (size_t i=0;i<A.cmds.size();i++) recordCmdOne(A, i);
 
@@ -908,7 +993,7 @@ int main(int argc, char** argv) {
         VkFenceCreateInfo af{}; af.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; // 初始 unsignaled，交给 acquire 使用
         vkCreateFence(A.dev, &af, nullptr, &A.acqFences[i]);
     }
-    std::fprintf(stderr, "G: 进入主循环（WASD 移动，QE 升降，方向键转头，Shift 加速，ESC 退出）\n");
+    std::fprintf(stderr, "G: 进入主循环（WASD 走角色，方向键绕角色转头，QE 拉近拉远，Shift 跑，ESC 退出）\n");
     MSG msg;
     uint32_t frame = 0;
     ULONGLONG last = GetTickCount64();
@@ -934,8 +1019,9 @@ int main(int argc, char** argv) {
         // 等该 image 上一次的提交完成，再安全重录
         vkWaitForFences(A.dev, 1, &A.fences[img], VK_TRUE, UINT64_MAX);
         vkResetFences(A.dev, 1, &A.fences[img]);
-        updateCam(cam, dt);
-        camFrame(cam.x, cam.z, cam.h, cam.yaw, cam.pitch, eye, tgt);
+        updatePlayer(cam, dt);
+        for (auto& o : A.objs) if (!o.model.empty()) setCharModel(o, g_char);
+        playerFrame(g_char, cam, eye, tgt);
         updateAllMVP(A, eye, tgt);
         vkResetCommandBuffer(A.cmds[img], 0);
         recordCmdOne(A, img);
