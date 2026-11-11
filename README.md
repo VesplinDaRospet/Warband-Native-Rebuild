@@ -1,5 +1,100 @@
 # Warband-Native-Rebuild
 
+## English
+
+A from-scratch C++/Vulkan renderer that reads original Mount&Blade: Warband assets and **does not depend on WSE2**.
+
+### v0.1-static-render — minimal static-rendering loop ✅
+
+Verified pipeline:
+
+```
+original .sco scene    ──► in-house SCO parser (sco.h)
+original .brf assets   ──► in-house BRF parser (brf.h)
+original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
+                              │
+                              ▼
+        in-house Vulkan renderer (vk_scene.cpp; no SDK, loads vulkan-1.dll at runtime)
+                              │
+                              ▼
+       Win32 window: 145 scene props + 107×108 terrain mesh (layered textures)
+       + original skybox_clearday dome + distance fog + directional light
+```
+
+> Legal scope: this repository contains **only original code and documentation**.
+> It includes no Mount&Blade copyrighted assets (models/textures/scene files), no translated
+> Native module TXT content, and no local paths or personal information. At runtime, point it
+> at a game directory that you legally own.
+
+### Layout
+
+- `src/`
+  - `brf.h` — BRF container parser (mesh/material/texture/shader/skeleton etc., independent implementation)
+  - `dds.h` — DDS DXT1/3/5 software decoder to RGBA8
+  - `sco.h` — SceneObj parser (objects + ai_mesh skip + all terrain layers)
+  - `vk_scene.cpp` — main scene renderer
+  - `vk_mesh.cpp` — minimal single-mesh + texture validation program
+  - `brf_dump / obj_export / dds_dump / sco_dump` — format validation tools
+  - `vk_probe.cpp` — Vulkan toolchain smoke test (dynamically loads vulkan-1.dll)
+  - `tmp_terrain.cpp` / `tmp_test.cpp` — terrain-layer / BRF-parse diagnostics
+  - `shot.ps1` — captures the vkSceneWnd window (`-OutDir` chooses the output folder, default `shots/`)
+- `shader/` — GLSL sources (`lit.*` = directional light version; `mesh.*`/`tex.*` = unlit validation versions)
+- `tools/shader-tool/` — GLSL → SPIR-V compiler tool (npm `@webgpu/glslang`)
+
+### Build
+
+Dependencies (not in this repo; obtain them yourself):
+
+1. `Vulkan-Headers` (headers only, no Vulkan SDK required): `git clone https://github.com/KhronosGroup/Vulkan-Headers`
+2. Compiler: w64devkit (GCC, works out of the box on Windows) or another MinGW/MSVC
+3. SPIR-V: `cd tools/shader-tool && npm install`, then compile `shader/*.vert|frag` into `*.spv` with `@webgpu/glslang`
+
+```sh
+g++ -std=c++20 -O2 src/vk_scene.cpp -o vk_scene.exe \
+    -I <vulkan-headers>/include -luser32 -lgdi32
+```
+
+### Run
+
+```sh
+vk_scene.exe \
+  "$GAMEDIR/Modules/Native/SceneObj/scn_town_1_center.sco" \
+  "$GAMEDIR/Modules/Native/scene_props.txt" \
+  "$GAMEDIR/CommonRes" \
+  "$GAMEDIR/Textures"
+```
+
+Press ESC in the window to exit. See the header comment of `vk_mesh.cpp` for its usage.
+
+### Reverse-engineered format notes (our own findings; cross-checking against public docs is welcome)
+
+- BRF: token stream `rfver `(i32) → texture/shader/material/mesh/skeleton/skeleton_anim/body → `end`;
+  every object type is preceded by a u32 count; strings = u32 length + bytes.
+- BRF meshes face the XZ plane; render mapping is `x'=x, y'=z, z'=-y`.
+- SCO: magic i32 `-717`, version 4; object positions are stored on disk as (x, z, y).
+- SCO terrain layer index `0..10` matches the row order in `Data/ground_specs.txt` (gray_stone…path);
+  `-7793` is the elevation float, `-12565` is vertex color. Terrain cell size is 2 m, grid origin (0,0).
+- Column 3 of `ground_specs.txt` is a BRF **material name**, which maps to a dds via the material table's diffuse field.
+
+Format-reference credits: OpenBRF (GPLv2, used only as a source of format facts), Swyter/mab-tools 010 templates,
+cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are independent implementations.
+
+### Roadmap
+
+- [x] v0.1 static render: BRF/SCO/DDS parsing + Vulkan on screen + layered terrain texturing + directional light
+- [x] Skybox / fog / far clipping (skyboxes.brf dome + linear distance fog + zf=800)
+- [x] Character & camera controls (third-person placeholder humanoid: WASD moves the character, arrow keys orbit, QE zooms, ground-snapped)
+- [x] Collision & pathfinding (SCO ai_mesh navmesh: 247 vertices / 422 edges / 173 faces; character constrained to walkable faces, slides along walls; G triggers A* pathfinding to the farthest walkable face)
+- [ ] Full original-scene experience
+
+### License
+
+[MIT](LICENSE)
+
+---
+
+## 中文
+
 从原版 Mount&Blade: Warband 资源出发、**不依赖 WSE2** 的自研 C++/Vulkan 渲染器。
 
 ## v0.1-static-render —— 静态渲染最小闭环 ✅
