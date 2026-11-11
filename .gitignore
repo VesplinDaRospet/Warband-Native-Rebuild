@@ -1,0 +1,19 @@
+# Official game files and local environments (never commit)
+# 官方游戏文件与本地环境（永不提交）
+Modules/
+SceneObj/
+Resource/
+Textures/
+Sounds/
+Music/
+Data/
+Languages/
+*.dll
+*.exe
+*.brf
+*.sco
+*.dds
+*.ogg
+*.wav
+*.ttf
+*.bik
