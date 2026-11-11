@@ -51,7 +51,8 @@ struct App {
     std::vector<VkFence> fences;
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
-    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> mvp; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; };
+    VkPipeline pipeSky = VK_NULL_HANDLE;
+    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; };
     std::vector<Obj> objs;
     std::vector<VkImageView> texViews;
     std::vector<std::string> texNames;
@@ -89,7 +90,7 @@ static void matMul44(const float* A, const float* B, std::vector<float>& out) {
 static void lookAt(std::vector<float>& V, float ex,float ey,float ez, float tx,float ty,float tz) {
     float fx=tx-ex, fy=ty-ey, fz=tz-ez;
     float fl=sqrtf(fx*fx+fy*fy+fz*fz); fx/=fl; fy/=fl; fz/=fl;
-    float ux=0, uy=1, uz=0;
+    float ux=0, uy=0, uz=1; // 渲染坐标高度轴是 z
     float sx=uy*fz-uz*fy, sy=uz*fx-ux*fz, sz=ux*fy-uy*fx;
     float sl=sqrtf(sx*sx+sy*sy+sz*sz); sx/=sl; sy/=sl; sz/=sl;
     float rx=sy*fz-sz*fy, ry=sz*fx-sx*fz, rz=sx*fy-sy*fx;
@@ -106,12 +107,16 @@ static void perspective(std::vector<float>& P, float fov, float aspect, float zn
     float M[16] = { x,0,0,0, 0,y,0,0, 0,0,q,-1, 0,0,q*zn,0 };
     P.assign(M, M+16);
 }
-static void computeSceneMVP(std::vector<float>& m, float cx, float cz) {
+static void computeSceneMVP(std::vector<float>& pc, float cx, float cz) {
     std::vector<float> V, P;
     // 渲染坐标：x=世界x, y=世界z(南北), z=世界y(高度)
-    lookAt(V, cx, cz+85.f, 55.f, cx, cz-18.f, 0.f);
+    float eye[3] = {cx, cz+85.f, 55.f};
+    lookAt(V, eye[0], eye[1], eye[2], cx, cz-18.f, 22.f);
     perspective(P, 1.0f, 1280.0f/720.0f, 0.5f, 800.0f);
-    matMul44(P.data(), V.data(), m);
+    pc.resize(24, 0.f);
+    matMul44(P.data(), V.data(), pc); // pc[0..15] = mvp
+    pc[16] = eye[0]; pc[17] = eye[1]; pc[18] = eye[2];
+    pc[20] = 70.f; pc[21] = 300.f;    // 雾起点/终点（世界距离）
 }
 
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
@@ -280,6 +285,7 @@ static void initVk(App& A) {
     VK_INST_FN(A.inst, vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(A.gpu, A.surface, &cap);
     if (cap.currentExtent.width < UINT32_MAX) A.extent = cap.currentExtent;
+    std::fprintf(stderr, "swapchain extent = %ux%u\n", A.extent.width, A.extent.height);
     VkSwapchainCreateInfoKHR sc{}; sc.sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     sc.surface=A.surface; sc.minImageCount=2; sc.imageFormat=A.fmt;
     sc.imageColorSpace=VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -358,10 +364,15 @@ static void initPipeline(App& A) {
         return m;
     };
     VkShaderModule vs = makeShader("lit.vert.spv"), fs = makeShader("lit.frag.spv");
+    VkShaderModule vsSky = makeShader("mesh.vert.spv"), fsSky = makeShader("mesh.frag.spv");
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType=stages[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT; stages[0].module=vs; stages[0].pName="main";
     stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module=fs; stages[1].pName="main";
+    VkPipelineShaderStageCreateInfo skyStages[2]{};
+    skyStages[0].sType=skyStages[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    skyStages[0].stage=VK_SHADER_STAGE_VERTEX_BIT; skyStages[0].module=vsSky; skyStages[0].pName="main";
+    skyStages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT; skyStages[1].module=fsSky; skyStages[1].pName="main";
 
     VkVertexInputBindingDescription bind{}; bind.binding=0; bind.stride=44; bind.inputRate=VK_VERTEX_INPUT_RATE_VERTEX;
     VkVertexInputAttributeDescription attrs[4]{};
@@ -372,6 +383,14 @@ static void initPipeline(App& A) {
     VkPipelineVertexInputStateCreateInfo vi{}; vi.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vi.vertexBindingDescriptionCount=1; vi.pVertexBindingDescriptions=&bind;
     vi.vertexAttributeDescriptionCount=4; vi.pVertexAttributeDescriptions=attrs;
+    // 天空 shader（mesh.vert/frag）是 3 属性版（pos+color+uv），顶点缓冲同为 44B stride，uv 在 offset 36
+    VkVertexInputAttributeDescription skyAttrs[3]{};
+    skyAttrs[0].location=0; skyAttrs[0].binding=0; skyAttrs[0].format=VK_FORMAT_R32G32B32_SFLOAT; skyAttrs[0].offset=0;
+    skyAttrs[1].location=1; skyAttrs[1].binding=0; skyAttrs[1].format=VK_FORMAT_R32G32B32_SFLOAT; skyAttrs[1].offset=12;
+    skyAttrs[2].location=2; skyAttrs[2].binding=0; skyAttrs[2].format=VK_FORMAT_R32G32_SFLOAT; skyAttrs[2].offset=36;
+    VkPipelineVertexInputStateCreateInfo viSky{}; viSky.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    viSky.vertexBindingDescriptionCount=1; viSky.pVertexBindingDescriptions=&bind;
+    viSky.vertexAttributeDescriptionCount=3; viSky.pVertexAttributeDescriptions=skyAttrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -385,10 +404,12 @@ static void initPipeline(App& A) {
     ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable=VK_TRUE; ds.depthWriteEnable=VK_TRUE; ds.depthCompareOp=VK_COMPARE_OP_LESS;
+    VkPipelineDepthStencilStateCreateInfo dsSky{}; dsSky.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    dsSky.depthTestEnable=VK_FALSE; dsSky.depthWriteEnable=VK_FALSE;
     VkPipelineColorBlendAttachmentState cb{}; cb.colorWriteMask=0xF; cb.blendEnable=VK_FALSE;
     VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cbs.attachmentCount=1; cbs.pAttachments=&cb;
-    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT, 0, 64};
+    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96};
     // descriptor set：binding 0 = combined image sampler
     VK_DEV_FN(A.dev, vkCreateDescriptorSetLayout); VK_DEV_FN(A.dev, vkCreateDescriptorPool);
     VK_DEV_FN(A.dev, vkAllocateDescriptorSets); VK_DEV_FN(A.dev, vkUpdateDescriptorSets);
@@ -424,8 +445,14 @@ static void initPipeline(App& A) {
     gp.pViewportState=&vsi; gp.pRasterizationState=&rs; gp.pMultisampleState=&ms; gp.pDepthStencilState=&ds;
     gp.pColorBlendState=&cbs; gp.layout=A.pipeLayout; gp.renderPass=A.rp; gp.subpass=0;
     CHECK(vkCreateGraphicsPipelines(A.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &A.pipe), "pipeline");
+    VkGraphicsPipelineCreateInfo gpSky{}; gpSky.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpSky.stageCount=2; gpSky.pStages=skyStages; gpSky.pVertexInputState=&viSky; gpSky.pInputAssemblyState=&ia;
+    gpSky.pViewportState=&vsi; gpSky.pRasterizationState=&rs; gpSky.pMultisampleState=&ms; gpSky.pDepthStencilState=&dsSky;
+    gpSky.pColorBlendState=&cbs; gpSky.layout=A.pipeLayout; gpSky.renderPass=A.rp; gpSky.subpass=0;
+    CHECK(vkCreateGraphicsPipelines(A.dev, VK_NULL_HANDLE, 1, &gpSky, nullptr, &A.pipeSky), "skyPipeline");
     VK_DEV_FN(A.dev, vkDestroyShaderModule);
     vkDestroyShaderModule(A.dev, vs, nullptr); vkDestroyShaderModule(A.dev, fs, nullptr);
+    vkDestroyShaderModule(A.dev, vsSky, nullptr); vkDestroyShaderModule(A.dev, fsSky, nullptr);
 }
 
 // 网格库：基础名 -> 该基础名下的所有网格片段（与 OpenBRF AnalyzeName 规则一致）
@@ -462,7 +489,7 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
         float r = ((v.color) & 0xFF) / 255.0f;
         float g = ((v.color >> 8) & 0xFF) / 255.0f;
         float b = ((v.color >> 16) & 0xFF) / 255.0f;
-        verts.push_back(r); verts.push_back(g); verts.push_back(b);
+        verts.push_back(1); verts.push_back(0); verts.push_back(0);
         // 法线：同一旋转矩阵变换 + 坐标映射，归一化
         float nx = prop.m[0]*v.normal.x + prop.m[1]*v.normal.y + prop.m[2]*v.normal.z;
         float ny = prop.m[3]*v.normal.x + prop.m[4]*v.normal.y + prop.m[5]*v.normal.z;
@@ -484,11 +511,11 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
     obj.idxCount = (uint32_t)mesh.indices.size();
     makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
     upload(A, obj.ib, obj.im, mesh.indices.data(), obj.idxCount*4);
-    computeSceneMVP(obj.mvp, cx, cz);
+    computeSceneMVP(obj.pc, cx, cz);
     if (A.objs.size() < 6) {
         float v[4] = {prop.pos[0], prop.pos[2], -prop.pos[1], 1.f};
         float c[4] = {};
-        for (int r=0;r<4;r++) for (int k=0;k<4;k++) c[r] += obj.mvp[k*4+r]*v[k];
+        for (int r=0;r<4;r++) for (int k=0;k<4;k++) c[r] += obj.pc[k*4+r]*v[k];
         std::fprintf(stderr, "  obj[%zu] mesh=%s 顶点=%zu 索引=%u pos=(%.1f %.1f %.1f) clip=(%.2f %.2f %.2f %.2f) ndc=(%.2f %.2f)\n",
             A.objs.size(), mesh.name.c_str(), verts.size()/11, obj.idxCount, prop.pos[0], prop.pos[1], prop.pos[2],
             c[0], c[1], c[2], c[3], c[3]!=0?c[0]/c[3]:9, c[3]!=0?c[1]/c[3]:9);
@@ -584,7 +611,7 @@ static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<Groun
         obj.idxCount = (uint32_t)idxs[li].size();
         makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
         upload(A, obj.ib, obj.im, idxs[li].data(), obj.idxCount*4);
-        computeSceneMVP(obj.mvp, cx, cz);
+        computeSceneMVP(obj.pc, cx, cz);
         A.objs.push_back(std::move(obj));
         made++;
     }
@@ -592,6 +619,44 @@ static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<Groun
     for (int li=0; li<=10; li++) if (!idxs[li].empty()) std::fprintf(stderr, " L%d:%zu", li, idxs[li].size()/6);
     std::fprintf(stderr, "\n");
 }
+// 原版天空穹顶：skyboxes.brf 的单位球网格，放大到远平面内并跟随相机水平位置
+static void makeSkyObj(App& A, const brf::Mesh& mesh, float cx, float cz, std::set<std::string>& needDds) {
+    const float S = 380.f; // 网格半径~1.87，缩放后~710m < zf=800
+    const float eye[3] = {cx, cz+85.f, 55.f};
+    std::vector<float> verts; verts.reserve(mesh.verts.size()*11);
+    for (auto& v : mesh.verts) {
+        if (v.index < 0 || (size_t)v.index >= mesh.positions.size()) continue;
+        auto& p = mesh.positions[v.index];
+        // BRF -> 渲染坐标：x'=x, y'=z, z'=-y；球心=相机位置
+        verts.push_back(eye[0] + p.x*S); verts.push_back(eye[1] + p.z*S); verts.push_back(eye[2] - p.y*S);
+        float r = ((v.color) & 0xFF) / 255.0f;
+        float g = ((v.color >> 8) & 0xFF) / 255.0f;
+        float b = ((v.color >> 16) & 0xFF) / 255.0f;
+        verts.push_back(r); verts.push_back(g); verts.push_back(b);
+        float nl = sqrtf(v.normal.x*v.normal.x + v.normal.y*v.normal.y + v.normal.z*v.normal.z); if (nl<1e-6f) nl=1;
+        verts.push_back(v.normal.x/nl); verts.push_back(v.normal.z/nl); verts.push_back(-v.normal.y/nl);
+        verts.push_back(v.uv.u); verts.push_back(v.uv.v);
+    }
+    App::Obj obj;
+    obj.sky = true;
+    std::string diff = "skybox_clearday";
+    auto dit = g_materialDiffuse.find(mesh.material);
+    if (dit != g_materialDiffuse.end() && !dit->second.empty()) diff = dit->second;
+    obj.diffName = diff;
+    needDds.insert(diff);
+    auto ti = A.texIndex.find(diff);
+    obj.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
+    obj.descSet = A.texSets.empty() ? VK_NULL_HANDLE : A.texSets[obj.texSlot];
+    makeBuffer(A, verts.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
+    upload(A, obj.vb, obj.vm, verts.data(), verts.size()*4);
+    obj.idxCount = (uint32_t)mesh.indices.size();
+    makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
+    upload(A, obj.ib, obj.im, mesh.indices.data(), obj.idxCount*4);
+    computeSceneMVP(obj.pc, cx, cz);
+    A.objs.push_back(std::move(obj));
+    std::fprintf(stderr, "天空穹顶 %s 顶点=%zu 三角形=%u 半径=%.0f\n", mesh.name.c_str(), verts.size()/11, obj.idxCount/3, S);
+}
+
 static void loadSceneAssets(App& A, const std::string& scoPath, const std::string& propsPath,
                             const std::string& commonRes, float& sceneCX, float& sceneCZ,
                             std::set<std::string>& needDds) {
@@ -687,6 +752,13 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
     } else {
         std::fprintf(stderr, "无地形数据，跳过地面网格\n");
     }
+    // 6. 天空穹顶（原版 skyboxes.brf 的 clearday 网格）
+    try {
+        brf::BrfFile sky = brf::parse((std::filesystem::path(commonRes) / "skyboxes.brf").string());
+        for (auto& m : sky.meshes) if (m.name == "skybox_clearday") { makeSkyObj(A, m, sceneCX, sceneCZ, needDds); break; }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "天空加载失败（%s），跳过\n", e.what());
+    }
 }
 
 static void recordCmd(App& A) {
@@ -700,7 +772,7 @@ static void recordCmd(App& A) {
     ca.commandPool=A.cmdPool; ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount=(uint32_t)A.images.size();
     A.cmds.resize(A.images.size());
     CHECK(vkAllocateCommandBuffers(A.dev, &ca, A.cmds.data()), "allocCmds");
-    VkClearValue cv[2]{}; cv[0].color={{0.05f,0.06f,0.10f,1}}; cv[1].depthStencil={1.0f,0};
+    VkClearValue cv[2]{}; cv[0].color={{0.47f,0.64f,1.0f,1}}; cv[1].depthStencil={1.0f,0};
     for (size_t i=0;i<A.cmds.size();i++) {
         VkCommandBufferBeginInfo bb{}; bb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(A.cmds[i], &bb);
@@ -708,10 +780,22 @@ static void recordCmd(App& A) {
         rp.renderPass=A.rp; rp.framebuffer=A.fbs[i]; rp.renderArea={{0,0},A.extent};
         rp.clearValueCount=2; rp.pClearValues=cv;
         vkCmdBeginRenderPass(A.cmds[i], &rp, VK_SUBPASS_CONTENTS_INLINE);
+        // 天空先画（无深度），随后场景正常深度覆盖
+        vkCmdBindPipeline(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeSky);
+        for (auto& o : A.objs) {
+            if (!o.sky) continue;
+            vkCmdBindDescriptorSets(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
+            vkCmdPushConstants(A.cmds[i], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
+            VkDeviceSize off=0;
+            vkCmdBindVertexBuffers(A.cmds[i], 0, 1, &o.vb, &off);
+            vkCmdBindIndexBuffer(A.cmds[i], o.ib, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(A.cmds[i], o.idxCount, 1, 0, 0, 0);
+        }
         vkCmdBindPipeline(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipe);
         for (auto& o : A.objs) {
+            if (o.sky) continue;
             vkCmdBindDescriptorSets(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
-            vkCmdPushConstants(A.cmds[i], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, o.mvp.data());
+            vkCmdPushConstants(A.cmds[i], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
             VkDeviceSize off=0;
             vkCmdBindVertexBuffers(A.cmds[i], 0, 1, &o.vb, &off);
             vkCmdBindIndexBuffer(A.cmds[i], o.ib, 0, VK_INDEX_TYPE_UINT32);
