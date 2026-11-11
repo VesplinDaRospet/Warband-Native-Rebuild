@@ -17,7 +17,7 @@
 > 运行本项目需用户自行拥有正版游戏。
 ```
 
-验收：README 首屏可见。 ✅（已做，2026-11-12；英文版声明同时加在英文区顶部）
+验收：README 首屏可见。 ✅（已做，2026-11-12；英文版声明同时加在英文区顶部；完整文本同时收于 COMPLIANCE.md。）
 
 ### 2. README 写清 MIT 覆盖范围
 
@@ -36,7 +36,7 @@ MIT 许可证不适用于：
 本仓库不分发任何官方游戏文件。示例路径仅作说明，运行需用户自行提供合法拥有的游戏环境。
 ```
 
-验收：LICENSE 文件保持 MIT；README 明确“仅原创代码”。 ✅
+验收：LICENSE 文件保持 MIT；README 明确“仅原创代码”。 ✅（详细 License scope 在 COMPLIANCE.md；README 保留一句+链接。）
 
 ### 3. 加 EULA 责任声明（中性表述）
 
@@ -50,7 +50,7 @@ Users are solely responsible for ensuring their use complies with the Mount & Bl
 and all applicable laws. The author claims no endorsement by or affiliation with TaleWorlds Entertainment.
 ```
 
-验收：不承认“反向工程”，只声明独立互操作与用户责任。 ✅
+验收：不承认“反向工程”，只声明独立互操作与用户责任。 ✅（EULA notice 全文收于 COMPLIANCE.md；README 链接过去。）
 
 ### 4. 中性化旧格式说明标题（已替换完毕）
 
@@ -208,4 +208,4 @@ No official game files are distributed by this repository.
 
 任何人（含贡献者与维护者）违反以上合规要求中的任何一条——包括但不限于提交官方资产、反编译或破解内容、请求打包官方游戏文件、泄露本地路径或凭据——本项目立即终结并删除仓库，无例外。
 
-对外执行措辞以 README「Compliance enforcement / 合规执行」为准：违规内容立即移除或阻断，重复或严重违规者永久封禁；若合规风险无法合理控制，维护者保留暂停或终止项目的权利，此类决定将向社区说明理由；本仓库为与 TaleWorlds Entertainment 无关联、未获背书的独立项目，以 MIT 许可证分发、适用其免责条款，第三方使用/修改/分发应自行守法并符合游戏 EULA；本项目不会向恶意行为者妥协，合规边界没有商量余地。
+对外执行措辞以 **COMPLIANCE.md**（正式合规政策，对外入口）为准：违规内容立即移除或阻断，重复或严重违规者永久封禁；若合规风险无法合理控制，维护者保留暂停或终止项目的权利，此类决定将向社区说明理由；本仓库为与 TaleWorlds Entertainment 无关联、未获背书的独立项目，以 MIT 许可证分发、适用其免责条款，第三方使用/修改/分发应自行守法并符合游戏 EULA；本项目不会向恶意行为者妥协，合规边界没有商量余地。README 只保留顶部非官方声明 + 一句 MIT 覆盖说明 + COMPLIANCE.md 链接；本清单为内部整改记录，不对外链接。
