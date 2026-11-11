@@ -48,7 +48,8 @@ struct App {
     std::vector<VkFramebuffer> fbs;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> cmds;
-    std::vector<VkFence> fences;
+    std::vector<VkFence> fences;      // 每帧提交完成
+    std::vector<VkFence> acqFences;   // acquire 完成（与提交分开，避免 acquire 失败卡死等待）
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipeline pipeSky = VK_NULL_HANDLE;
@@ -536,7 +537,7 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
         float r = ((v.color) & 0xFF) / 255.0f;
         float g = ((v.color >> 8) & 0xFF) / 255.0f;
         float b = ((v.color >> 16) & 0xFF) / 255.0f;
-        verts.push_back(1); verts.push_back(0); verts.push_back(0);
+        verts.push_back(r); verts.push_back(g); verts.push_back(b);
         // 法线：同一旋转矩阵变换 + 坐标映射，归一化
         float nx = prop.m[0]*v.normal.x + prop.m[1]*v.normal.y + prop.m[2]*v.normal.z;
         float ny = prop.m[3]*v.normal.x + prop.m[4]*v.normal.y + prop.m[5]*v.normal.z;
@@ -900,9 +901,12 @@ int main(int argc, char** argv) {
     VK_DEV_FN(A.dev, vkAcquireNextImageKHR); VK_DEV_FN(A.dev, vkQueueSubmit); VK_DEV_FN(A.dev, vkQueuePresentKHR);
     VK_DEV_FN(A.dev, vkCreateFence); VK_DEV_FN(A.dev, vkWaitForFences); VK_DEV_FN(A.dev, vkResetFences); VK_DEV_FN(A.dev, vkResetCommandBuffer);
     A.fences.resize(A.images.size());
-    for (auto& f : A.fences) {
+    A.acqFences.resize(A.images.size());
+    for (size_t i=0;i<A.images.size();i++) {
         VkFenceCreateInfo fi{}; fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
-        vkCreateFence(A.dev, &fi, nullptr, &f);
+        vkCreateFence(A.dev, &fi, nullptr, &A.fences[i]);
+        VkFenceCreateInfo af{}; af.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; // 初始 unsignaled，交给 acquire 使用
+        vkCreateFence(A.dev, &af, nullptr, &A.acqFences[i]);
     }
     std::fprintf(stderr, "G: 进入主循环（WASD 移动，QE 升降，方向键转头，Shift 加速，ESC 退出）\n");
     MSG msg;
@@ -916,21 +920,29 @@ int main(int argc, char** argv) {
         ULONGLONG now = GetTickCount64();
         float dt = std::min(0.1f, (float)(now - last)/1000.f);
         last = now;
+        size_t fi = frame % A.images.size();
         uint32_t img=0;
-        VkResult ar = vkAcquireNextImageKHR(A.dev, A.swap, UINT64_MAX, VK_NULL_HANDLE, A.fences[frame%A.fences.size()], &img);
-        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { std::printf("acquire=%d\n", ar); continue; }
-        vkWaitForFences(A.dev, 1, &A.fences[frame%A.fences.size()], VK_TRUE, UINT64_MAX);
-        vkResetFences(A.dev, 1, &A.fences[frame%A.fences.size()]);
-        if (updateCam(cam, dt)) {
-            camFrame(cam.x, cam.z, cam.h, cam.yaw, cam.pitch, eye, tgt);
-            updateAllMVP(A, eye, tgt);
-            vkResetCommandBuffer(A.cmds[img], 0);
-            recordCmdOne(A, img);
+        VkResult ar = vkAcquireNextImageKHR(A.dev, A.swap, UINT64_MAX, VK_NULL_HANDLE, A.acqFences[fi], &img);
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            // 出错（如 out-of-date）：复位本次 acquire fence，避免下轮死等；窗口无 resize 时很少走到这里
+            vkResetFences(A.dev, 1, &A.acqFences[fi]);
+            Sleep(10);
+            continue;
         }
+        vkWaitForFences(A.dev, 1, &A.acqFences[fi], VK_TRUE, UINT64_MAX);
+        vkResetFences(A.dev, 1, &A.acqFences[fi]);
+        // 等该 image 上一次的提交完成，再安全重录
+        vkWaitForFences(A.dev, 1, &A.fences[img], VK_TRUE, UINT64_MAX);
+        vkResetFences(A.dev, 1, &A.fences[img]);
+        updateCam(cam, dt);
+        camFrame(cam.x, cam.z, cam.h, cam.yaw, cam.pitch, eye, tgt);
+        updateAllMVP(A, eye, tgt);
+        vkResetCommandBuffer(A.cmds[img], 0);
+        recordCmdOne(A, img);
         VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{}; si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount=1; si.pCommandBuffers=&A.cmds[img]; si.waitSemaphoreCount=0; si.pWaitDstStageMask=&ws;
-        vkQueueSubmit(A.queue, 1, &si, A.fences[frame%A.fences.size()]);
+        vkQueueSubmit(A.queue, 1, &si, A.fences[img]);
         VkPresentInfoKHR pi{}; pi.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         pi.swapchainCount=1; pi.pSwapchains=&A.swap; pi.pImageIndices=&img;
         vkQueuePresentKHR(A.queue, &pi);
