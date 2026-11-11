@@ -32,6 +32,9 @@
   - `vk_scene.cpp` —— 场景渲染主程序
   - `vk_mesh.cpp` —— 单网格+贴图最小验证程序
   - `brf_dump / obj_export / dds_dump / sco_dump` —— 格式验证工具
+  - `vk_probe.cpp` —— Vulkan 链路自检（动态加载 vulkan-1.dll）
+  - `tmp_terrain.cpp` / `tmp_test.cpp` —— 地形分层 / BRF 连通性诊断
+  - `shot.ps1` —— 截取 vkSceneWnd 窗口（`-OutDir` 指定输出目录，默认 `shots/`）
 - `shader/` —— GLSL 源（`lit.*` 为方向光版本；`mesh.*`/`tex.*` 为无光验证版本）
 - `tools/shader-tool/` —— GLSL → SPIR-V 编译工具（npm `@webgpu/glslang`）
 
