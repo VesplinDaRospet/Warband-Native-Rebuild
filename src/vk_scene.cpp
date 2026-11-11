@@ -107,11 +107,17 @@ static void perspective(std::vector<float>& P, float fov, float aspect, float zn
     float M[16] = { x,0,0,0, 0,y,0,0, 0,0,q,-1, 0,0,q*zn,0 };
     P.assign(M, M+16);
 }
-static void computeSceneMVP(std::vector<float>& pc, float cx, float cz) {
+static void camFrame(float cx, float cz, float eyeH, float yaw, float pitch, float eye[3], float target[3]) {
+    eye[0]=cx; eye[1]=cz; eye[2]=eyeH;
+    float fhx = -sinf(yaw), fhz = -cosf(yaw); // yaw=0 朝世界 -z（场景中心方向）
+    target[0] = cx + fhx*103.f;
+    target[1] = cz + fhz*103.f;
+    target[2] = eyeH + tanf(pitch)*103.f;
+}
+static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const float target[3]) {
     std::vector<float> V, P;
-    // 渲染坐标：x=世界x, y=世界z(南北), z=世界y(高度)
-    float eye[3] = {cx, cz+85.f, 55.f};
-    lookAt(V, eye[0], eye[1], eye[2], cx, cz-18.f, 22.f);
+    // 渲染坐标：x=世界x, y=世界z(南北), z=世界y(高度)；up=高度轴
+    lookAt(V, eye[0], eye[1], eye[2], target[0], target[1], target[2]);
     perspective(P, 1.0f, 1280.0f/720.0f, 0.5f, 800.0f);
     pc.resize(24, 0.f);
     matMul44(P.data(), V.data(), pc); // pc[0..15] = mvp
@@ -458,6 +464,47 @@ static void initPipeline(App& A) {
 // 网格库：基础名 -> 该基础名下的所有网格片段（与 OpenBRF AnalyzeName 规则一致）
 static std::map<std::string, std::vector<brf::Mesh>> g_meshGroups;
 static std::map<std::string, std::string> g_materialDiffuse;
+static sco::Terrain g_terrain;
+
+struct Cam { float x=0, z=0, h=55.f, yaw=0.f, pitch=-0.32f; };
+static float terrainHeightAt(float x, float z) {
+    if (g_terrain.width < 2 || g_terrain.height < 2 || g_terrain.elevation.empty()) return 0.f;
+    float fi = x/2.f, fj = z/2.f; // cell=2m，原点(0,0)
+    int i0 = (int)floorf(fi), j0 = (int)floorf(fj);
+    i0 = std::max(0, std::min(i0, (int)g_terrain.width-1));
+    j0 = std::max(0, std::min(j0, (int)g_terrain.height-1));
+    int i1 = std::min(i0+1, (int)g_terrain.width-1), j1 = std::min(j0+1, (int)g_terrain.height-1);
+    float fx = std::max(0.f, std::min(fi-i0, 1.f)), fz = std::max(0.f, std::min(fj-j0, 1.f));
+    auto e = [&](int i, int j) -> float {
+        size_t idx = (size_t)j*g_terrain.width+i;
+        return idx < g_terrain.elevation.size() ? g_terrain.elevation[idx] : 0.f;
+    };
+    float h0 = e(i0,j0)*(1-fx) + e(i1,j0)*fx;
+    float h1 = e(i0,j1)*(1-fx) + e(i1,j1)*fx;
+    return h0*(1-fz) + h1*fz;
+}
+static bool updateCam(Cam& c, float dt) {
+    float sx=0, sz=0, dh=0, dy=0, dp=0;
+    auto k = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    if (k('W')) sz += 1; if (k('S')) sz -= 1;
+    if (k('D')) sx += 1; if (k('A')) sx -= 1;
+    if (k('E')) dh += 1; if (k('Q')) dh -= 1;
+    if (k(VK_LEFT)) dy += 1; if (k(VK_RIGHT)) dy -= 1;
+    if (k(VK_UP)) dp += 1; if (k(VK_DOWN)) dp -= 1;
+    if (!(sx||sz||dh||dy||dp)) return false;
+    float speed = (k(VK_SHIFT) ? 60.f : 18.f) * dt;
+    float fx = -sinf(c.yaw), fz = -cosf(c.yaw);
+    float rx = cosf(c.yaw), rz = -sinf(c.yaw);
+    c.x += (fx*sz + rx*sx)*speed;
+    c.z += (fz*sz + rz*sx)*speed;
+    c.h += dh*speed*0.5f;
+    c.yaw += dy*1.4f*dt;
+    c.pitch = std::max(-1.2f, std::min(0.05f, c.pitch + dp*0.9f*dt));
+    float th = terrainHeightAt(c.x, c.z);
+    if (c.h < th + 1.5f) c.h = th + 1.5f; // 不穿地
+    if (c.h > th + 80.f) c.h = th + 80.f;
+    return true;
+}
 
 // "arena_barrier_b.4" -> "arena_barrier_b"；"name.lod2.1" 是 LOD 变体（lod>0 跳过）
 static std::string meshBaseName(const std::string& name) {
@@ -511,7 +558,8 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
     obj.idxCount = (uint32_t)mesh.indices.size();
     makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
     upload(A, obj.ib, obj.im, mesh.indices.data(), obj.idxCount*4);
-    computeSceneMVP(obj.pc, cx, cz);
+    float eye0[3], tgt0[3]; camFrame(cx, cz, 55.f, 0.f, -0.32f, eye0, tgt0);
+    computeSceneMVP(obj.pc, eye0, tgt0);
     if (A.objs.size() < 6) {
         float v[4] = {prop.pos[0], prop.pos[2], -prop.pos[1], 1.f};
         float c[4] = {};
@@ -611,7 +659,8 @@ static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<Groun
         obj.idxCount = (uint32_t)idxs[li].size();
         makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
         upload(A, obj.ib, obj.im, idxs[li].data(), obj.idxCount*4);
-        computeSceneMVP(obj.pc, cx, cz);
+        float eye0[3], tgt0[3]; camFrame(cx, cz, 55.f, 0.f, -0.32f, eye0, tgt0);
+    computeSceneMVP(obj.pc, eye0, tgt0);
         A.objs.push_back(std::move(obj));
         made++;
     }
@@ -652,7 +701,8 @@ static void makeSkyObj(App& A, const brf::Mesh& mesh, float cx, float cz, std::s
     obj.idxCount = (uint32_t)mesh.indices.size();
     makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
     upload(A, obj.ib, obj.im, mesh.indices.data(), obj.idxCount*4);
-    computeSceneMVP(obj.pc, cx, cz);
+    float eye0[3], tgt0[3]; camFrame(cx, cz, 55.f, 0.f, -0.32f, eye0, tgt0);
+    computeSceneMVP(obj.pc, eye0, tgt0);
     A.objs.push_back(std::move(obj));
     std::fprintf(stderr, "天空穹顶 %s 顶点=%zu 三角形=%u 半径=%.0f\n", mesh.name.c_str(), verts.size()/11, obj.idxCount/3, S);
 }
@@ -726,8 +776,9 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
     }
     sco::Terrain terr;
     bool hasTerrain = sco::loadTerrain(scoPath, terr);
+    if (hasTerrain) g_terrain = std::move(terr);
     float tcx=0, tcz=0;
-    if (hasTerrain) { tcx = terr.width*2.0f/2; tcz = terr.height*2.0f/2; }
+    if (hasTerrain) { tcx = g_terrain.width*2.0f/2; tcz = g_terrain.height*2.0f/2; }
     sceneCX=(mnx+mxx+tcx)/3; sceneCZ=(mnz+mxz+tcz)/3;
     std::fprintf(stderr, "中心: props=(%.1f,%.1f) terrain=(%.1f,%.1f) -> (%.1f,%.1f)\n",
                  (mnx+mxx)/2, (mnz+mxz)/2, tcx, tcz, sceneCX, sceneCZ);
@@ -748,7 +799,7 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
     }
     std::fprintf(stderr, "场景物件实例 %zu 个已建缓冲\n", made);
     if (hasTerrain) {
-        makeGroundObj(A, terr, gspecs, sceneCX, sceneCZ, needDds);
+        makeGroundObj(A, g_terrain, gspecs, sceneCX, sceneCZ, needDds);
     } else {
         std::fprintf(stderr, "无地形数据，跳过地面网格\n");
     }
@@ -761,49 +812,55 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
     }
 }
 
-static void recordCmd(App& A) {
-    VK_DEV_FN(A.dev, vkAllocateCommandBuffers); VK_DEV_FN(A.dev, vkBeginCommandBuffer);
+static void allocCmds(App& A) {
+    VK_DEV_FN(A.dev, vkAllocateCommandBuffers);
+    VkCommandBufferAllocateInfo ca{}; ca.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ca.commandPool=A.cmdPool; ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount=(uint32_t)A.images.size();
+    A.cmds.resize(A.images.size());
+    CHECK(vkAllocateCommandBuffers(A.dev, &ca, A.cmds.data()), "allocCmds");
+}
+
+static void updateAllMVP(App& A, const float eye[3], const float target[3]) {
+    for (auto& o : A.objs) computeSceneMVP(o.pc, eye, target);
+}
+
+static void recordCmdOne(App& A, size_t img) {
+    VK_DEV_FN(A.dev, vkBeginCommandBuffer);
     VK_DEV_FN(A.dev, vkCmdBeginRenderPass); VK_DEV_FN(A.dev, vkCmdBindPipeline);
     VK_DEV_FN(A.dev, vkCmdBindDescriptorSets);
     VK_DEV_FN(A.dev, vkCmdPushConstants); VK_DEV_FN(A.dev, vkCmdBindVertexBuffers);
     VK_DEV_FN(A.dev, vkCmdBindIndexBuffer); VK_DEV_FN(A.dev, vkCmdDrawIndexed);
     VK_DEV_FN(A.dev, vkCmdEndRenderPass); VK_DEV_FN(A.dev, vkEndCommandBuffer);
-    VkCommandBufferAllocateInfo ca{}; ca.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ca.commandPool=A.cmdPool; ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount=(uint32_t)A.images.size();
-    A.cmds.resize(A.images.size());
-    CHECK(vkAllocateCommandBuffers(A.dev, &ca, A.cmds.data()), "allocCmds");
+    VkCommandBufferBeginInfo bb{}; bb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    vkBeginCommandBuffer(A.cmds[img], &bb);
     VkClearValue cv[2]{}; cv[0].color={{0.47f,0.64f,1.0f,1}}; cv[1].depthStencil={1.0f,0};
-    for (size_t i=0;i<A.cmds.size();i++) {
-        VkCommandBufferBeginInfo bb{}; bb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        vkBeginCommandBuffer(A.cmds[i], &bb);
-        VkRenderPassBeginInfo rp{}; rp.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rp.renderPass=A.rp; rp.framebuffer=A.fbs[i]; rp.renderArea={{0,0},A.extent};
-        rp.clearValueCount=2; rp.pClearValues=cv;
-        vkCmdBeginRenderPass(A.cmds[i], &rp, VK_SUBPASS_CONTENTS_INLINE);
-        // 天空先画（无深度），随后场景正常深度覆盖
-        vkCmdBindPipeline(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeSky);
-        for (auto& o : A.objs) {
-            if (!o.sky) continue;
-            vkCmdBindDescriptorSets(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
-            vkCmdPushConstants(A.cmds[i], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
-            VkDeviceSize off=0;
-            vkCmdBindVertexBuffers(A.cmds[i], 0, 1, &o.vb, &off);
-            vkCmdBindIndexBuffer(A.cmds[i], o.ib, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(A.cmds[i], o.idxCount, 1, 0, 0, 0);
-        }
-        vkCmdBindPipeline(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipe);
-        for (auto& o : A.objs) {
-            if (o.sky) continue;
-            vkCmdBindDescriptorSets(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
-            vkCmdPushConstants(A.cmds[i], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
-            VkDeviceSize off=0;
-            vkCmdBindVertexBuffers(A.cmds[i], 0, 1, &o.vb, &off);
-            vkCmdBindIndexBuffer(A.cmds[i], o.ib, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(A.cmds[i], o.idxCount, 1, 0, 0, 0);
-        }
-        vkCmdEndRenderPass(A.cmds[i]);
-        vkEndCommandBuffer(A.cmds[i]);
+    VkRenderPassBeginInfo rp{}; rp.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass=A.rp; rp.framebuffer=A.fbs[img]; rp.renderArea={{0,0},A.extent};
+    rp.clearValueCount=2; rp.pClearValues=cv;
+    vkCmdBeginRenderPass(A.cmds[img], &rp, VK_SUBPASS_CONTENTS_INLINE);
+    // 天空先画（无深度），随后场景正常深度覆盖
+    vkCmdBindPipeline(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeSky);
+    for (auto& o : A.objs) {
+        if (!o.sky) continue;
+        vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
+        vkCmdPushConstants(A.cmds[img], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
+        VkDeviceSize off=0;
+        vkCmdBindVertexBuffers(A.cmds[img], 0, 1, &o.vb, &off);
+        vkCmdBindIndexBuffer(A.cmds[img], o.ib, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(A.cmds[img], o.idxCount, 1, 0, 0, 0);
     }
+    vkCmdBindPipeline(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipe);
+    for (auto& o : A.objs) {
+        if (o.sky) continue;
+        vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
+        vkCmdPushConstants(A.cmds[img], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
+        VkDeviceSize off=0;
+        vkCmdBindVertexBuffers(A.cmds[img], 0, 1, &o.vb, &off);
+        vkCmdBindIndexBuffer(A.cmds[img], o.ib, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(A.cmds[img], o.idxCount, 1, 0, 0, 0);
+    }
+    vkCmdEndRenderPass(A.cmds[img]);
+    vkEndCommandBuffer(A.cmds[img]);
 }
 
 int main(int argc, char** argv) {
@@ -832,8 +889,13 @@ int main(int argc, char** argv) {
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
         o.descSet = A.texSets[o.texSlot];
     }
-    std::fprintf(stderr, "F: recordCmd\n");
-    recordCmd(A);
+    std::fprintf(stderr, "F: allocCmds\n");
+    allocCmds(A);
+    Cam cam; cam.x = sceneCX; cam.z = sceneCZ;
+    float eye[3], tgt[3];
+    camFrame(cam.x, cam.z, cam.h, cam.yaw, cam.pitch, eye, tgt);
+    updateAllMVP(A, eye, tgt);
+    for (size_t i=0;i<A.cmds.size();i++) recordCmdOne(A, i);
 
     VK_DEV_FN(A.dev, vkAcquireNextImageKHR); VK_DEV_FN(A.dev, vkQueueSubmit); VK_DEV_FN(A.dev, vkQueuePresentKHR);
     VK_DEV_FN(A.dev, vkCreateFence); VK_DEV_FN(A.dev, vkWaitForFences); VK_DEV_FN(A.dev, vkResetFences); VK_DEV_FN(A.dev, vkResetCommandBuffer);
@@ -842,20 +904,29 @@ int main(int argc, char** argv) {
         VkFenceCreateInfo fi{}; fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(A.dev, &fi, nullptr, &f);
     }
-    std::fprintf(stderr, "G: 进入主循环\n");
-    std::printf("窗口已创建，ESC 退出。\n");
+    std::fprintf(stderr, "G: 进入主循环（WASD 移动，QE 升降，方向键转头，Shift 加速，ESC 退出）\n");
     MSG msg;
     uint32_t frame = 0;
+    ULONGLONG last = GetTickCount64();
     while (true) {
         while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) return 0;
             TranslateMessage(&msg); DispatchMessageA(&msg);
         }
+        ULONGLONG now = GetTickCount64();
+        float dt = std::min(0.1f, (float)(now - last)/1000.f);
+        last = now;
         uint32_t img=0;
         VkResult ar = vkAcquireNextImageKHR(A.dev, A.swap, UINT64_MAX, VK_NULL_HANDLE, A.fences[frame%A.fences.size()], &img);
         if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { std::printf("acquire=%d\n", ar); continue; }
         vkWaitForFences(A.dev, 1, &A.fences[frame%A.fences.size()], VK_TRUE, UINT64_MAX);
         vkResetFences(A.dev, 1, &A.fences[frame%A.fences.size()]);
+        if (updateCam(cam, dt)) {
+            camFrame(cam.x, cam.z, cam.h, cam.yaw, cam.pitch, eye, tgt);
+            updateAllMVP(A, eye, tgt);
+            vkResetCommandBuffer(A.cmds[img], 0);
+            recordCmdOne(A, img);
+        }
         VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{}; si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount=1; si.pCommandBuffers=&A.cmds[img]; si.waitSemaphoreCount=0; si.pWaitDstStageMask=&ws;

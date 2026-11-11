@@ -77,7 +77,7 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 
 - [x] v0.1 静态渲染：BRF/SCO/DDS 解析 + Vulkan 上屏 + 地形分层贴图 + 方向光
 - [x] 天空盒 / 雾 / 远裁剪（skyboxes.brf 穹顶 + 线性距离雾 + zf=800）
-- [ ] 角色与相机操控
+- [x] 角色与相机操控（WASD+QE 飞行/走地，方向键转头，地形高度钳制，不穿地）
 - [ ] 碰撞与寻路（SCO ai_mesh）
 - [ ] 完整原版场景体验
 
