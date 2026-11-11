@@ -73,6 +73,16 @@ struct TerrainLayer {
     std::vector<uint32_t> colors;   // leveling：逐 cell r,g,b,a（小端 u32）
 };
 
+// ai_mesh：导航网格（010 模板：vertex=x,y水平,height；edge=5×i32；face=顶点/边索引对+hasMore）
+struct AiEdge { int32_t adj=0, a=0, b=0, faceR=-10000, faceL=-10000; };
+struct AiFace { std::vector<uint32_t> verts, edges; uint32_t id=0; };
+struct AiMesh {
+    std::vector<float> vertX, vertY, vertH; // 逐顶点
+    std::vector<AiEdge> edges;
+    std::vector<AiFace> faces;
+    bool ok=false;
+};
+
 struct Terrain {
     uint32_t width = 0, height = 0;
     std::vector<float> elevation; // width*height，逐行
@@ -82,6 +92,50 @@ struct Terrain {
         return nullptr;
     }
 };
+
+// 解析 ai_mesh 导航网格（与 loadTerrain 一样重开文件、跳过 mission_objects）
+inline bool loadAiMesh(const std::string& path, AiMesh& m, bool verbose=false) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("SCO 打不开: " + path);
+    R r(f);
+    int magic = r.i32();
+    if (magic != -717) throw std::runtime_error("SCO 魔数不对");
+    int version = r.i32();
+    uint32_t n = r.u32();
+    for (uint32_t i=0;i<n;i++) {
+        r.u32(); r.u32(); r.u32();
+        r.skip(9*4); r.skip(3*4);
+        uint32_t tl = r.u32(); r.skip(tl);
+        r.u32(); r.u32();
+        if (version > 2) r.skip(3*4);
+    }
+    if (version <= 3) return false;
+    uint32_t sectionSize = r.u32();
+    (void)sectionSize;
+    uint32_t vCount = r.u32();
+    m.vertX.resize(vCount); m.vertY.resize(vCount); m.vertH.resize(vCount);
+    for (uint32_t i=0;i<vCount;i++) {
+        m.vertX[i]=r.f32(); m.vertY[i]=r.f32(); m.vertH[i]=r.f32(); // x, y(水平), height
+    }
+    uint32_t eCount = r.u32();
+    m.edges.resize(eCount);
+    for (auto& e : m.edges) {
+        e.adj=r.i32(); e.a=r.i32(); e.b=r.i32(); e.faceR=r.i32(); e.faceL=r.i32();
+    }
+    uint32_t fCount = r.u32();
+    m.faces.resize(fCount);
+    for (auto& fc : m.faces) {
+        uint32_t c = r.u32();
+        fc.verts.resize(c); fc.edges.resize(c);
+        for (uint32_t i=0;i<c;i++) fc.verts[i]=r.u32();
+        for (uint32_t i=0;i<c;i++) fc.edges[i]=r.u32();
+        uint32_t more = r.u32();
+        if (more) fc.id = r.u32();
+    }
+    m.ok = !m.faces.empty();
+    if (verbose) std::printf("ai_mesh verts=%u edges=%u faces=%u\n", vCount, eCount, fCount);
+    return m.ok;
+}
 
 // 在 mission_objects 之后继续解析 ai_mesh + terrain（version>3 才有）
 inline bool loadTerrain(const std::string& path, Terrain& t, bool verbose=false) {

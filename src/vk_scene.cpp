@@ -472,10 +472,80 @@ static void initPipeline(App& A) {
 static std::map<std::string, std::vector<brf::Mesh>> g_meshGroups;
 static std::map<std::string, std::string> g_materialDiffuse;
 static sco::Terrain g_terrain;
-
-struct Cam { float yaw=0.f, height=5.f, dist=9.f; };          // 第三人称相机：绕角色的水平角/高度/距离
 struct Char { float x=0, z=0, yaw=0.f; };
 static Char g_char;
+static sco::AiMesh g_aiMesh;
+static int32_t g_lastFace = -1;
+static std::vector<int32_t> g_path; static size_t g_pathIdx = 0; static bool g_wasG = false;
+
+// 点是否在导航面多边形内（凸多边形叉积同号）
+static bool pointInFace(const sco::AiMesh& m, int32_t fi, float x, float z) {
+    if (fi < 0 || (size_t)fi >= m.faces.size()) return false;
+    const auto& fc = m.faces[fi];
+    if (fc.verts.size() < 3) return false;
+    int sign = 0;
+    for (size_t i=0;i<fc.verts.size();i++) {
+        size_t j = (i+1)%fc.verts.size();
+        uint32_t a = fc.verts[i], b = fc.verts[j];
+        if (a >= m.vertX.size() || b >= m.vertX.size()) return false;
+        float ax = m.vertX[a], az = m.vertY[a], bx = m.vertX[b], bz = m.vertY[b];
+        float cross = (bx-ax)*(z-az) - (bz-az)*(x-ax);
+        int s = cross > 1e-6f ? 1 : (cross < -1e-6f ? -1 : 0);
+        if (s != 0) {
+            if (sign == 0) sign = s;
+            else if (sign != s) return false;
+        }
+    }
+    return true;
+}
+static int32_t findFace(float x, float z) {
+    if (g_lastFace >= 0 && pointInFace(g_aiMesh, g_lastFace, x, z)) return g_lastFace;
+    for (size_t i=0;i<g_aiMesh.faces.size();i++)
+        if (pointInFace(g_aiMesh, (int32_t)i, x, z)) { g_lastFace = (int32_t)i; return g_lastFace; }
+    return -1;
+}
+// 碰撞：先整体移动；不行则分别只动 x / 只动 z（沿墙滑动）；都不行原地不动
+static void moveCharBlocked(float nx, float nz) {
+    if (!g_aiMesh.ok) { g_char.x=nx; g_char.z=nz; return; } // 无导航网格的内景：自由移动
+    if (findFace(nx, nz) >= 0) { g_char.x=nx; g_char.z=nz; return; }
+    if (findFace(nx, g_char.z) >= 0) { g_char.x=nx; return; }
+    if (findFace(g_char.x, nz) >= 0) { g_char.z=nz; return; }
+}
+static void faceCenter(int32_t fi, float& x, float& z) {
+    x=z=0; int n=0;
+    for (uint32_t vi : g_aiMesh.faces[fi].verts) if (vi < g_aiMesh.vertX.size()) { x+=g_aiMesh.vertX[vi]; z+=g_aiMesh.vertY[vi]; n++; }
+    if (n) { x/=n; z/=n; }
+}
+// BFS 面邻接寻路（导航网格；边表 face 引用在此文件不可靠，按共享顶点建邻接）
+static std::vector<int32_t> findFacePath(int32_t from, int32_t to) {
+    std::vector<int32_t> out;
+    if (from < 0 || to < 0) return out;
+    if (from == to) { out.push_back(from); return out; }
+    size_t nf = g_aiMesh.faces.size();
+    std::vector<std::vector<int32_t>> adj(nf);
+    for (size_t i=0;i<nf;i++) {
+        std::set<uint32_t> vi(g_aiMesh.faces[i].verts.begin(), g_aiMesh.faces[i].verts.end());
+        for (size_t j=i+1;j<nf;j++) {
+            for (uint32_t v : g_aiMesh.faces[j].verts)
+                if (vi.count(v)) { adj[i].push_back((int32_t)j); adj[j].push_back((int32_t)i); break; }
+        }
+    }
+    std::vector<int32_t> prev(nf, -2); std::vector<int32_t> q;
+    q.push_back(from); prev[from]=-1;
+    bool found=false;
+    for (size_t h=0;h<q.size();h++) {
+        int32_t c=q[h];
+        if (c==to) { found=true; break; }
+        for (int32_t nb : adj[c]) if (prev[nb] == -2) { prev[nb]=c; q.push_back(nb); }
+    }
+    if (!found) return out;
+    int32_t c=to; out.push_back(c);
+    while (prev[c] != -1) { c=prev[c]; out.push_back(c); }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+struct Cam { float yaw=0.f, height=5.f, dist=9.f; };          // 第三人称相机：绕角色的水平角/高度/距离
 static float terrainHeightAt(float x, float z) {
     if (g_terrain.width < 2 || g_terrain.height < 2 || g_terrain.elevation.empty()) return 0.f;
     float fi = x/2.f, fj = z/2.f; // cell=2m，原点(0,0)
@@ -509,11 +579,44 @@ static bool updatePlayer(Cam& cam, float dt) {
     if (k(VK_LEFT)) dy += 1; if (k(VK_RIGHT)) dy -= 1;
     if (k(VK_UP)) dp += 1; if (k(VK_DOWN)) dp -= 1;
     if (k('E')) dd -= 1; if (k('Q')) dd += 1;   // QE 拉近/拉远相机
+    bool gDown = k('G');
+    if (gDown && !g_wasG) { // G：A* 寻路到离当前最远的可走面，自动走
+        int32_t from = findFace(g_char.x, g_char.z);
+        float fx0=0, fz0=0; if (from >= 0) faceCenter(from, fx0, fz0);
+        int32_t to = from; float best = -1.f;
+        for (size_t i=0;i<g_aiMesh.faces.size();i++) {
+            float cx=0, cz=0; faceCenter((int32_t)i, cx, cz);
+            float d = (cx-fx0)*(cx-fx0) + (cz-fz0)*(cz-fz0);
+            if (d > best) { best = d; to = (int32_t)i; }
+        }
+        g_path = findFacePath(from, to);
+        g_pathIdx = 0;
+        std::fprintf(stderr, "寻路: 起点face=%d 目标face=%d 路径长度=%zu\n", from, to, g_path.size());
+    }
+    g_wasG = gDown;
     cam.yaw += dy*1.6f*dt;
     cam.height = std::max(2.0f, std::min(20.f, cam.height + dp*6.f*dt));
     cam.dist = std::max(4.0f, std::min(30.f, cam.dist + dd*10.f*dt));
-    if (!(sx||sz||dy||dp||dd)) return false;
     float speed = (k(VK_SHIFT) ? 12.f : 5.5f) * dt;
+    if (sx || sz) g_path.clear(); // 手动接管
+    if (!g_path.empty() && g_pathIdx < g_path.size()) {
+        float wx=0, wz=0;
+        faceCenter(g_path[g_pathIdx], wx, wz);
+        float dx = wx - g_char.x, dz = wz - g_char.z;
+        float dl = sqrtf(dx*dx + dz*dz);
+        if (dl < 0.6f) { g_pathIdx++; }
+        else {
+            float step = std::min(dl, speed);
+            moveCharBlocked(g_char.x + dx/dl*step, g_char.z + dz/dl*step);
+            float ty = atan2f(-dx/dl, -dz/dl);
+            float dyy = ty - g_char.yaw;
+            while (dyy > 3.14159f) dyy -= 6.28318f;
+            while (dyy < -3.14159f) dyy += 6.28318f;
+            g_char.yaw += dyy * std::min(1.f, 8.f*dt);
+        }
+        return true;
+    }
+    if (!(sx||sz||dy||dp||dd)) return false;
     // 以相机方向为基准：相机看向角色，前方 = 从相机到角色的水平方向
     float fx = -sinf(cam.yaw), fz = -cosf(cam.yaw);
     float rx = cosf(cam.yaw), rz = -sinf(cam.yaw);
@@ -521,8 +624,7 @@ static bool updatePlayer(Cam& cam, float dt) {
     float mz = fz*sz + rz*sx;
     float ml = sqrtf(mx*mx + mz*mz);
     if (ml > 1e-6f) {
-        g_char.x += mx/ml * speed;
-        g_char.z += mz/ml * speed;
+        moveCharBlocked(g_char.x + mx/ml * speed, g_char.z + mz/ml * speed);
         float targetYaw = atan2f(-mx/ml, -mz/ml); // 模型前方 +y 的朝向
         float dyaw = targetYaw - g_char.yaw;
         while (dyaw > 3.14159f) dyaw -= 6.28318f;
@@ -854,6 +956,10 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
     }
     sco::Terrain terr;
     bool hasTerrain = sco::loadTerrain(scoPath, terr);
+    sco::AiMesh aim;
+    try { sco::loadAiMesh(scoPath, aim); } catch (const std::exception& e) { std::fprintf(stderr, "ai_mesh 解析失败: %s\n", e.what()); }
+    g_aiMesh = std::move(aim);
+    std::fprintf(stderr, "ai_mesh ok=%d verts=%zu edges=%zu faces=%zu\n", (int)g_aiMesh.ok, g_aiMesh.vertX.size(), g_aiMesh.edges.size(), g_aiMesh.faces.size());
     if (hasTerrain) g_terrain = std::move(terr);
     float tcx=0, tcz=0;
     if (hasTerrain) { tcx = g_terrain.width*2.0f/2; tcz = g_terrain.height*2.0f/2; }
