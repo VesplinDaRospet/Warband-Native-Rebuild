@@ -40,16 +40,16 @@ This project maintains a **zero-tolerance policy** for compliance violations.
 
 The following are strictly prohibited and will be removed or blocked immediately:
 - Submitting, requesting, or distributing any official game files, assets, data, or executables;
-- Submitting decompiled, reverse-engineered, or cracked content;
+- Submitting unauthorized proprietary code, decompiled or disassembled code obtained without authorization, cracked files, or copyrighted extracted content;
 - Using this repository to facilitate piracy, license circumvention, or IP infringement.
 
-Violations will result in immediate content removal and permanent bans for repeat or serious offenders.
-The maintainer may suspend, terminate the project, or delete this repository **at any time, with or without reason or notice**.
+Violations of these rules will result in immediate content removal and, for repeat or serious offenders, permanent bans.
+The maintainer reserves the right to suspend or discontinue the project if compliance risks cannot be reasonably contained. Any such decision will be communicated to the community with a clear rationale.
+This project will not be held hostage by bad actors. Compliance boundaries are non-negotiable.
 
 This repository is an independent project with no affiliation with or endorsement from TaleWorlds Entertainment.
-The author is not responsible for any third-party use, modification, or fork of this repository.
-
-Violators will be removed. The project will not be held hostage by bad actors.
+This project is distributed under the MIT License. The license's warranty disclaimer applies.
+Third parties who use, modify, or distribute this code are solely responsible for ensuring their conduct complies with applicable laws and the Mount & Blade: Warband EULA.
 
 ### Layout
 
@@ -169,16 +169,16 @@ and all applicable laws. The author claims no endorsement by or affiliation with
 
 以下行为严格禁止，一经发现立即删除或阻断：
 - 提交、索要或分发任何官方游戏文件、资产、数据或可执行文件；
-- 提交反编译、逆向工程或破解内容；
+- 提交未经授权取得的专有代码、未经授权获取的反编译或反汇编代码、破解文件，以及受版权保护的提取内容；
 - 利用本仓库协助盗版、绕过授权或侵犯知识产权。
 
-违规内容将被立即移除；重复或严重违规者永久封禁。
-维护者可随时、以任何理由或无需任何理由，暂停、终止本项目或删除本仓库，无需另行通知。
+违反上述规则的内容将被立即移除；重复或严重违规者将被永久封禁。
+若合规风险无法合理控制，维护者保留暂停或终止项目的权利。此类决定将向社区说明理由。
+本项目不会向恶意行为者妥协。合规边界没有商量余地。
 
 本仓库是与 TaleWorlds Entertainment 无任何关联、亦未获其背书的独立项目。
-作者不对任何第三方对本仓库的使用、修改或 fork 承担责任。
-
-违规者将被清除。本项目不会向恶意行为者妥协。
+本项目以 MIT 许可证分发，适用该许可证中的免责条款。
+第三方使用、修改或分发本代码时，应自行确保其行为符合适用法律及《骑马与砍杀：战团》EULA。
 
 ## 目录
 
