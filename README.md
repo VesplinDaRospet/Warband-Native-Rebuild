@@ -1,5 +1,13 @@
 # Warband-Native-Rebuild
 
+> **Unofficial fan project**: This project is not affiliated with, endorsed by, or authorized by
+> TaleWorlds Entertainment. This project does not provide any official Mount & Blade: Warband game
+> files, assets, data, or executables. Running this project requires a legally owned copy of the game.
+
+> **非官方粉丝项目**：本项目与 TaleWorlds Entertainment 无关联，未获其背书或授权。
+> 本项目不提供《骑马与砍杀：战团》的任何官方游戏文件、资产、数据或可执行文件。
+> 运行本项目需用户自行拥有正版游戏。
+
 ## English
 
 A from-scratch C++/Vulkan renderer that reads original Mount&Blade: Warband assets and **does not depend on WSE2**.
@@ -65,8 +73,9 @@ vk_scene.exe \
 ```
 
 Press ESC in the window to exit. See the header comment of `vk_mesh.cpp` for its usage.
+Example paths are illustrative only; no official game files are bundled with this repository.
 
-### Reverse-engineered format notes (our own findings; cross-checking against public docs is welcome)
+### Independent format interoperability notes (our own findings; cross-checking against public docs is welcome)
 
 - BRF: token stream `rfver `(i32) → texture/shader/material/mesh/skeleton/skeleton_anim/body → `end`;
   every object type is preceded by a u32 count; strings = u32 length + bytes.
@@ -86,6 +95,25 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 - [x] Character & camera controls (third-person placeholder humanoid: WASD moves the character, arrow keys orbit, QE zooms, ground-snapped)
 - [x] Collision & pathfinding (SCO ai_mesh navmesh: 247 vertices / 422 edges / 173 faces; character constrained to walkable faces, slides along walls; G triggers A* pathfinding to the farthest walkable face)
 - [ ] Full original-scene experience
+
+### License scope
+
+The MIT license in this repository applies only to original source code authored by the project author.
+
+It does not apply to:
+
+- Mount & Blade: Warband and any of its official code, assets, data, text, audio, fonts, or trademarks;
+- any third-party or environment dependencies (each governed by its own project's license);
+- official game files owned locally by users.
+
+This repository does not distribute any official game files. Example paths are illustrative only;
+running requires a legally owned game environment provided by the user.
+
+### EULA notice
+
+This project is an independent interoperability effort. It does not distribute any official game files.
+Users are solely responsible for ensuring their use complies with the Mount & Blade: Warband EULA
+and all applicable laws. The author claims no endorsement by or affiliation with TaleWorlds Entertainment.
 
 ### License
 
@@ -156,9 +184,9 @@ vk_scene.exe \
   "$GAMEDIR/Textures"
 ```
 
-窗口 ESC 退出。`vk_mesh.exe` 的用法见 `vk_mesh.cpp` 头部注释。
+窗口 ESC 退出。`vk_mesh.exe` 的用法见 `vk_mesh.cpp` 头部注释。示例路径仅作说明，不附带官方文件。
 
-## 格式破译要点（自研经验，欢迎对照公开资料复核）
+## 独立格式互操作性笔记（自研经验，欢迎对照公开资料复核）
 
 - BRF：token 流 `rfver `(i32) → texture/shader/material/mesh/skeleton/skeleton_anim/body → `end`；
   每类对象先读 u32 数量；字符串 = u32 长度 + 字节。
@@ -178,6 +206,22 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 - [x] 角色与相机操控（第三人称占位人形：WASD 走角色，方向键绕角色转头，QE 拉近拉远，贴地行走）
 - [x] 碰撞与寻路（SCO ai_mesh 导航网格：247 顶点/422 边/173 面；角色限走可走面、沿墙滑动；G 键 A* 自动寻路到最远可走面）
 - [ ] 完整原版场景体验
+
+## 许可证范围
+
+本仓库的 MIT 许可证仅适用于由本项目作者原创的源代码。
+
+MIT 许可证不适用于：
+- 《骑马与砍杀：战团》及其任何官方代码、资产、数据、文本、音频、字体、商标；
+- 任何第三方依赖或环境依赖（其许可证由各自项目决定）；
+- 用户本地拥有的官方游戏文件。
+
+本仓库不分发任何官方游戏文件。示例路径仅作说明，运行需用户自行提供合法拥有的游戏环境。
+
+## EULA 责任声明
+
+本项目是独立的互操作性尝试，不分发任何官方游戏文件。用户自行负责确保其使用符合
+《骑马与砍杀：战团》EULA 及所有适用法律。作者声明与 TaleWorlds Entertainment 无背书或关联。
 
 ## 许可证
 
