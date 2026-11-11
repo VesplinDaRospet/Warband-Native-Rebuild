@@ -33,8 +33,20 @@ original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
 > It includes no Mount&Blade copyrighted assets (models/textures/scene files), no translated
 > Native module TXT content, and no local paths or personal information. At runtime, point it
 > at a game directory that you legally own.
-> Anyone violating the compliance rules (see COMPLIANCE_TODO.md) triggers project termination
-> and repository deletion.
+
+### Compliance enforcement
+
+This project maintains a **zero-tolerance policy** for compliance violations.
+
+The following are strictly prohibited and will be removed or blocked immediately:
+- Submitting, requesting, or distributing any official game files, assets, data, or executables;
+- Submitting decompiled, reverse-engineered, or cracked content;
+- Using this repository to facilitate piracy, license circumvention, or IP infringement.
+
+Violations will result in immediate content removal and permanent bans for repeat or serious offenders.
+The maintainer reserves the right to suspend or terminate the project, or delete the repository, if compliance risks cannot be contained.
+
+Violators will be removed. The project will not be held hostage by bad actors.
 
 ### Layout
 
@@ -147,7 +159,20 @@ and all applicable laws. The author claims no endorsement by or affiliation with
 > 合法范围说明：本仓库**只包含自研代码与文档**。不含任何 Mount&Blade 版权资产
 > （模型/贴图/场景文件），不含 Native 模块 TXT 翻译内容，不含本地路径或个人信息。
 > 运行时请在你自己合法拥有的游戏目录上指定资源路径。
-> 任何人违反合规规则（见 COMPLIANCE_TODO.md），本项目立即终结并删除仓库。
+
+## 合规执行
+
+本项目对违规行为实行**零容忍**。
+
+以下行为严格禁止，一经发现立即删除或阻断：
+- 提交、索要或分发任何官方游戏文件、资产、数据或可执行文件；
+- 提交反编译、逆向工程或破解内容；
+- 利用本仓库协助盗版、绕过授权或侵犯知识产权。
+
+违规内容将被立即移除；重复或严重违规者永久封禁。
+若合规风险无法控制，维护者保留暂停、终止项目或删除仓库的权利。
+
+违规者将被清除。本项目不会向恶意行为者妥协。
 
 ## 目录
 

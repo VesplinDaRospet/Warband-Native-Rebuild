@@ -65,7 +65,7 @@ and all applicable laws. The author claims no endorsement by or affiliation with
 
 检索命令已在整改 commit 90505d5 中执行并归档（模式见该 commit 的 diff），当前仓库不再保留可命中的旧词文本。
 
-验收：README、docs、注释中不再使用旧表述作为项目自我描述。 ✅（README 两处标题已替换；全仓检索零命中，含本清单。）
+验收：README、docs、注释中不使用旧表述作为项目自我描述。 ✅（README 两处标题已替换；旧术语仅以“禁止对象”出现在 README 的 Compliance enforcement / 合规执行 禁令条款中，属合规条款本身而非自我描述；其余位置零命中。）
 
 ### 5. 检查 git 历史是否提交过官方文件
 
@@ -192,7 +192,7 @@ No official game files are distributed by this repository.
 - [x] README 首屏有非官方声明。
 - [x] README 明确 MIT 仅覆盖原创代码。
 - [x] README 有 EULA notice 和用户责任声明。
-- [x] 全文无旧表述作为自我描述（全仓检索零命中）。
+- [x] 全文无旧表述作为自我描述（仅禁止性条款以禁止对象列出，其余零命中）。
 - [x] git 历史敏感文件检查通过，或已制定清理计划。
 - [x] .gitignore 覆盖官方文件类型和目录。
 - [x] 无 GPL 代码混入 MIT 代码。
@@ -207,3 +207,5 @@ No official game files are distributed by this repository.
 ## 六、零容忍终止条款（女王令）
 
 任何人（含贡献者与维护者）违反以上合规要求中的任何一条——包括但不限于提交官方资产、反编译或破解内容、请求打包官方游戏文件、泄露本地路径或凭据——本项目立即终结并删除仓库，无例外。
+
+对外执行措辞以 README「Compliance enforcement / 合规执行」为准：违规内容立即移除或阻断，重复或严重违规者永久封禁；维护者保留暂停、终止项目或删除仓库的权利；违规者将被清除，本项目不会向恶意行为者妥协。
