@@ -1,0 +1,523 @@
+// vk_mesh.cpp —— 自研最小闭环：解析 BRF 网格并用 Vulkan 渲染
+// 依赖：brf.h（同目录）、mesh.vert.spv / mesh.frag.spv（tools/shader-tool 生成）
+#define VK_NO_PROTOTYPES
+#define VK_USE_PLATFORM_WIN32_KHR
+#include <vulkan/vulkan.h>
+#include <windows.h>
+#include "brf.h"
+#include "dds.h"
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
+#include <functional>
+#include <vector>
+#include <string>
+#include <fstream>
+
+// ---------- Vulkan 函数动态加载 ----------
+static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
+static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
+static PFN_vkCreateInstance vkCreateInstance;
+static PFN_vkCreateDevice vkCreateDevice;
+static PFN_vkDestroyInstance vkDestroyInstance;
+#define VK_INST_FN(inst, name) auto name = (PFN_##name)vkGetInstanceProcAddr(inst, #name)
+#define VK_DEV_FN(dev, name)  auto name = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
+
+struct App {
+    HINSTANCE hInst = nullptr; HWND hwnd = nullptr;
+    VkInstance inst = VK_NULL_HANDLE;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkPhysicalDevice gpu = VK_NULL_HANDLE;
+    VkDevice dev = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t qf = 0;
+    VkSwapchainKHR swap = VK_NULL_HANDLE;
+    VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D extent{1280, 720};
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    std::vector<VkFramebuffer> fbs;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> cmds;
+    std::vector<VkFence> fences;
+    VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkBuffer vbuf = VK_NULL_HANDLE, ibuf = VK_NULL_HANDLE;
+    VkDeviceMemory vmem = VK_NULL_HANDLE, imem = VK_NULL_HANDLE;
+    VkImage depthImg = VK_NULL_HANDLE; VkImageView depthView = VK_NULL_HANDLE; VkDeviceMemory depthMem = VK_NULL_HANDLE;
+    VkImage texImg = VK_NULL_HANDLE; VkDeviceMemory texMem = VK_NULL_HANDLE; VkImageView texView = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descPool = VK_NULL_HANDLE;
+    VkDescriptorSet descSet = VK_NULL_HANDLE;
+    uint32_t indexCount = 0;
+    std::vector<float> mvp; // column-major mat4
+};
+
+static void CHECK(VkResult r, const char* what) {
+    if (r != VK_SUCCESS) { std::printf("FAIL %s = %d\n", what, r); std::exit(1); }
+}
+
+static std::vector<char> readFile(const char* path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { std::printf("FAIL 打不开 %s\n", path); std::exit(1); }
+    std::vector<char> b((size_t)f.tellg());
+    f.seekg(0); f.read(b.data(), b.size());
+    return b;
+}
+
+static void computeMVP(std::vector<float>& m, float rot, const brf::Vec3& bmin, const brf::Vec3& bmax) {
+    // 模型归一化 + 绕Y旋转 + 透视（column-major）
+    brf::Vec3 c{ (bmin.x+bmax.x)/2, (bmin.y+bmax.y)/2, (bmin.z+bmax.z)/2 };
+    float span = std::max({bmax.x-bmin.x, bmax.y-bmin.y, bmax.z-bmin.z});
+    if (span < 1e-6f) span = 1.f;
+    float s = 2.2f / span;
+    float cr = cosf(rot), sr = sinf(rot);
+    // T * R * S 按列主序
+    float M[16] = {
+        cr*s, 0, sr*s, 0,
+        0, s, 0, 0,
+        -sr*s, 0, cr*s, 0,
+        -c.x*cr*s + c.z*sr*s, -c.y*s - 0.35f, -c.x*sr*s - c.z*cr*s - 2.5f, 1
+    };
+    m.assign(M, M+16);
+    // 透视投影（列主序）
+    float fov = 1.0f, a = (float)1280/720, zn=0.05f, zf=50.0f;
+    float y = 1.0f/tanf(fov/2), x = y/a, q = zf/(zn-zf);
+    float P[16] = { x,0,0,0, 0,y,0,0, 0,0,q,-1, 0,0,q*zn,0 };
+    std::vector<float> out(16);
+    for (int c=0;c<4;c++) for (int r=0;r<4;r++) {
+        out[c*4+r]=0;
+        for (int k=0;k<4;k++) out[c*4+r] += P[k*4+r]*m[c*4+k];
+    }
+    m = out;
+}
+
+static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_CLOSE || (msg == WM_KEYDOWN && w == VK_ESCAPE)) PostQuitMessage(0);
+    return DefWindowProcA(h, msg, w, l);
+}
+
+static uint32_t findMemType(VkInstance inst, VkPhysicalDevice gpu, uint32_t typeBits, VkMemoryPropertyFlags props) {
+    VkPhysicalDeviceMemoryProperties mp;
+    auto fn = (PFN_vkGetPhysicalDeviceMemoryProperties)vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceMemoryProperties");
+    fn(gpu, &mp);
+    for (uint32_t i=0;i<mp.memoryTypeCount;i++)
+        if ((typeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & props) == props) return i;
+    std::printf("FAIL 无合适内存类型\n"); std::exit(1);
+    return 0;
+}
+
+static void makeBuffer(App& A, VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf, VkDeviceMemory& mem) {
+    VK_DEV_FN(A.dev, vkCreateBuffer);
+    VK_DEV_FN(A.dev, vkAllocateMemory);
+    VK_DEV_FN(A.dev, vkBindBufferMemory);
+    VK_DEV_FN(A.dev, vkGetBufferMemoryRequirements);
+    VkBufferCreateInfo bi{}; bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=size; bi.usage=usage;
+    CHECK(vkCreateBuffer(A.dev, &bi, nullptr, &buf), "createBuffer");
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(A.dev, buf, &mr);
+    VkMemoryAllocateInfo ai{}; ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=mr.size;
+    ai.memoryTypeIndex=findMemType(A.inst, A.gpu, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    CHECK(vkAllocateMemory(A.dev, &ai, nullptr, &mem), "allocBufferMem");
+    vkBindBufferMemory(A.dev, buf, mem, 0);
+}
+
+static void upload(App& A, VkBuffer buf, VkDeviceMemory mem, const void* data, VkDeviceSize size) {
+    VK_DEV_FN(A.dev, vkMapMemory); VK_DEV_FN(A.dev, vkUnmapMemory);
+    void* p; CHECK(vkMapMemory(A.dev, mem, 0, size, 0, &p), "map");
+    memcpy(p, data, (size_t)size); vkUnmapMemory(A.dev, mem);
+}
+
+// 一次性提交命令（纹理上传/布局转换用）
+static void submitOnce(App& A, const std::function<void(VkCommandBuffer)>& fn) {
+    VK_DEV_FN(A.dev, vkAllocateCommandBuffers); VK_DEV_FN(A.dev, vkBeginCommandBuffer);
+    VK_DEV_FN(A.dev, vkEndCommandBuffer); VK_DEV_FN(A.dev, vkQueueSubmit); VK_DEV_FN(A.dev, vkQueueWaitIdle);
+    VK_DEV_FN(A.dev, vkFreeCommandBuffers); VK_DEV_FN(A.dev, vkCreateFence); VK_DEV_FN(A.dev, vkWaitForFences); VK_DEV_FN(A.dev, vkDestroyFence);
+    VkCommandBufferAllocateInfo ca{}; ca.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ca.commandPool=A.cmdPool; ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount=1;
+    VkCommandBuffer cb; CHECK(vkAllocateCommandBuffers(A.dev, &ca, &cb), "allocOnce");
+    VkCommandBufferBeginInfo bb{}; bb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO; bb.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bb);
+    fn(cb);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{}; si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount=1; si.pCommandBuffers=&cb;
+    CHECK(vkQueueSubmit(A.queue, 1, &si, VK_NULL_HANDLE), "submitOnce");
+    vkQueueWaitIdle(A.queue);
+    vkFreeCommandBuffers(A.dev, A.cmdPool, 1, &cb);
+}
+
+static void initTexture(App& A, const char* path) {
+    dds::Image img = dds::load(path);
+    std::printf("贴图 %s %ux%u\n", path, img.width, img.height);
+    VK_DEV_FN(A.dev, vkCreateImage); VK_DEV_FN(A.dev, vkAllocateMemory); VK_DEV_FN(A.dev, vkBindImageMemory);
+    VK_DEV_FN(A.dev, vkGetImageMemoryRequirements); VK_DEV_FN(A.dev, vkCreateImageView);
+    VK_DEV_FN(A.dev, vkCreateSampler); VK_DEV_FN(A.dev, vkCmdCopyBufferToImage); VK_DEV_FN(A.dev, vkCmdPipelineBarrier);
+    // staging
+    VkBuffer stage; VkDeviceMemory smem;
+    makeBuffer(A, img.rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stage, smem);
+    upload(A, stage, smem, img.rgba.data(), img.rgba.size());
+    // image
+    VkImageCreateInfo ii{}; ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType=VK_IMAGE_TYPE_2D;
+    ii.format=VK_FORMAT_R8G8B8A8_UNORM; ii.extent={img.width,img.height,1}; ii.mipLevels=1; ii.arrayLayers=1;
+    ii.samples=VK_SAMPLE_COUNT_1_BIT; ii.tiling=VK_IMAGE_TILING_OPTIMAL;
+    ii.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT; ii.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+    CHECK(vkCreateImage(A.dev, &ii, nullptr, &A.texImg), "texImage");
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(A.dev, A.texImg, &mr);
+    VkMemoryAllocateInfo ma{}; ma.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ma.allocationSize=mr.size;
+    ma.memoryTypeIndex=findMemType(A.inst, A.gpu, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    CHECK(vkAllocateMemory(A.dev, &ma, nullptr, &A.texMem), "texMem");
+    vkBindImageMemory(A.dev, A.texImg, A.texMem, 0);
+    // copy + transition
+    submitOnce(A, [&](VkCommandBuffer cb) {
+        VkBufferImageCopy bc{}; bc.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+        bc.imageSubresource.layerCount=1; bc.imageExtent={img.width,img.height,1};
+        vkCmdCopyBufferToImage(cb, stage, A.texImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+        VkImageMemoryBarrier bar{}; bar.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        bar.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; bar.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        bar.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; bar.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        bar.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; bar.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        bar.image=A.texImg; bar.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+        bar.subresourceRange.levelCount=1; bar.subresourceRange.layerCount=1;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &bar);
+    });
+    VK_DEV_FN(A.dev, vkDestroyBuffer); VK_DEV_FN(A.dev, vkFreeMemory);
+    vkDestroyBuffer(A.dev, stage, nullptr); vkFreeMemory(A.dev, smem, nullptr);
+    // view
+    VkImageViewCreateInfo vi{}; vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image=A.texImg; vi.viewType=VK_IMAGE_VIEW_TYPE_2D; vi.format=VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount=1; vi.subresourceRange.layerCount=1;
+    CHECK(vkCreateImageView(A.dev, &vi, nullptr, &A.texView), "texView");
+    // sampler
+    VkSamplerCreateInfo sc{}; sc.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sc.magFilter=VK_FILTER_LINEAR; sc.minFilter=VK_FILTER_LINEAR;
+    sc.addressModeU=VK_SAMPLER_ADDRESS_MODE_REPEAT; sc.addressModeV=VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sc.maxLod=1.0f;
+    CHECK(vkCreateSampler(A.dev, &sc, nullptr, &A.sampler), "sampler");
+}
+
+static void initVk(App& A) {
+    HMODULE dll = LoadLibraryA("vulkan-1.dll");
+    if (!dll) { std::printf("FAIL vulkan-1.dll\n"); std::exit(1); }
+    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(dll, "vkGetInstanceProcAddr");
+    vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)GetProcAddress(dll, "vkGetDeviceProcAddr");
+    vkCreateInstance = (PFN_vkCreateInstance)GetProcAddress(dll, "vkCreateInstance");
+    vkCreateDevice = (PFN_vkCreateDevice)GetProcAddress(dll, "vkCreateDevice");
+    vkDestroyInstance = (PFN_vkDestroyInstance)GetProcAddress(dll, "vkDestroyInstance");
+
+    VkApplicationInfo ai{}; ai.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO; ai.apiVersion=VK_API_VERSION_1_0;
+    const char* ext = VK_KHR_SURFACE_EXTENSION_NAME;
+    const char* wext = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+    VkInstanceCreateInfo ci{}; ci.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ci.pApplicationInfo=&ai; ci.enabledExtensionCount=2; ci.ppEnabledExtensionNames=(const char*[]){ext,wext};
+    CHECK(vkCreateInstance(&ci, nullptr, &A.inst), "createInstance");
+
+    VK_INST_FN(A.inst, vkCreateWin32SurfaceKHR);
+    VkWin32SurfaceCreateInfoKHR si{}; si.sType=VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+    si.hinstance=A.hInst; si.hwnd=A.hwnd;
+    CHECK(vkCreateWin32SurfaceKHR(A.inst, &si, nullptr, &A.surface), "win32surface");
+
+    VK_INST_FN(A.inst, vkEnumeratePhysicalDevices);
+    uint32_t n=0; vkEnumeratePhysicalDevices(A.inst, &n, nullptr);
+    if (!n) { std::printf("FAIL 无GPU\n"); std::exit(1); }
+    std::vector<VkPhysicalDevice> gpus(n); vkEnumeratePhysicalDevices(A.inst, &n, gpus.data());
+    A.gpu = gpus[0];
+
+    VK_INST_FN(A.inst, vkGetPhysicalDeviceQueueFamilyProperties);
+    uint32_t qn=0; vkGetPhysicalDeviceQueueFamilyProperties(A.gpu, &qn, nullptr);
+    std::vector<VkQueueFamilyProperties> qps(qn); vkGetPhysicalDeviceQueueFamilyProperties(A.gpu, &qn, qps.data());
+    A.qf = UINT32_MAX;
+    for (uint32_t i=0;i<qn;i++) {
+        if (!(qps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+        VK_INST_FN(A.inst, vkGetPhysicalDeviceWin32PresentationSupportKHR);
+        if (!vkGetPhysicalDeviceWin32PresentationSupportKHR(A.gpu, i)) continue;
+        A.qf = i; break;
+    }
+    if (A.qf==UINT32_MAX) { std::printf("FAIL 无图形+呈现队列\n"); std::exit(1); }
+
+    float prio=1.0f;
+    VkDeviceQueueCreateInfo qi{}; qi.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qi.queueFamilyIndex=A.qf; qi.queueCount=1; qi.pQueuePriorities=&prio;
+    const char* devExt = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    VkDeviceCreateInfo di{}; di.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    di.queueCreateInfoCount=1; di.pQueueCreateInfos=&qi;
+    di.enabledExtensionCount=1; di.ppEnabledExtensionNames=&devExt;
+    CHECK(vkCreateDevice(A.gpu, &di, nullptr, &A.dev), "createDevice");
+    VK_DEV_FN(A.dev, vkGetDeviceQueue); vkGetDeviceQueue(A.dev, A.qf, 0, &A.queue);
+
+    // swapchain
+    VK_DEV_FN(A.dev, vkGetSwapchainImagesKHR); VK_DEV_FN(A.dev, vkCreateSwapchainKHR); VK_DEV_FN(A.dev, vkCreateImageView);
+    VkSurfaceCapabilitiesKHR cap;
+    VK_INST_FN(A.inst, vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(A.gpu, A.surface, &cap);
+    if (cap.currentExtent.width < UINT32_MAX) A.extent = cap.currentExtent;
+    VkSwapchainCreateInfoKHR sc{}; sc.sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sc.surface=A.surface; sc.minImageCount=2; sc.imageFormat=A.fmt;
+    sc.imageColorSpace=VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    sc.imageExtent=A.extent; sc.imageArrayLayers=1; sc.imageUsage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sc.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE; sc.preTransform=cap.currentTransform;
+    sc.compositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; sc.presentMode=VK_PRESENT_MODE_FIFO_KHR; sc.clipped=VK_TRUE;
+    CHECK(vkCreateSwapchainKHR(A.dev, &sc, nullptr, &A.swap), "swapchain");
+    uint32_t in=0; vkGetSwapchainImagesKHR(A.dev, A.swap, &in, nullptr);
+    A.images.resize(in); vkGetSwapchainImagesKHR(A.dev, A.swap, &in, A.images.data());
+    for (auto img : A.images) {
+        VkImageViewCreateInfo vi{}; vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vi.image=img; vi.viewType=VK_IMAGE_VIEW_TYPE_2D; vi.format=A.fmt;
+        vi.subresourceRange.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount=1; vi.subresourceRange.layerCount=1;
+        VkImageView v; CHECK(vkCreateImageView(A.dev, &vi, nullptr, &v), "imageView");
+        A.views.push_back(v);
+    }
+    // depth
+    VK_DEV_FN(A.dev, vkCreateImage); VK_DEV_FN(A.dev, vkAllocateMemory); VK_DEV_FN(A.dev, vkBindImageMemory);
+    VkImageCreateInfo ii{}; ii.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ii.imageType=VK_IMAGE_TYPE_2D;
+    ii.format=VK_FORMAT_D32_SFLOAT; ii.extent={A.extent.width,A.extent.height,1}; ii.mipLevels=1; ii.arrayLayers=1;
+    ii.samples=VK_SAMPLE_COUNT_1_BIT; ii.tiling=VK_IMAGE_TILING_OPTIMAL;
+    ii.usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT; ii.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+    CHECK(vkCreateImage(A.dev, &ii, nullptr, &A.depthImg), "depthImage");
+    VK_DEV_FN(A.dev, vkGetImageMemoryRequirements);
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(A.dev, A.depthImg, &mr);
+    VkMemoryAllocateInfo ma{}; ma.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ma.allocationSize=mr.size;
+    ma.memoryTypeIndex=findMemType(A.inst, A.gpu, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    CHECK(vkAllocateMemory(A.dev, &ma, nullptr, &A.depthMem), "depthMem");
+    vkBindImageMemory(A.dev, A.depthImg, A.depthMem, 0);
+    VkImageViewCreateInfo dv{}; dv.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    dv.image=A.depthImg; dv.viewType=VK_IMAGE_VIEW_TYPE_2D; dv.format=VK_FORMAT_D32_SFLOAT;
+    dv.subresourceRange.aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT; dv.subresourceRange.levelCount=1; dv.subresourceRange.layerCount=1;
+    CHECK(vkCreateImageView(A.dev, &dv, nullptr, &A.depthView), "depthView");
+
+    // render pass
+    VK_DEV_FN(A.dev, vkCreateRenderPass);
+    VkAttachmentDescription at[2]{};
+    at[0].format=A.fmt; at[0].samples=VK_SAMPLE_COUNT_1_BIT; at[0].loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;
+    at[0].storeOp=VK_ATTACHMENT_STORE_OP_STORE; at[0].stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    at[0].stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE; at[0].initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+    at[0].finalLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    at[1].format=VK_FORMAT_D32_SFLOAT; at[1].samples=VK_SAMPLE_COUNT_1_BIT; at[1].loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;
+    at[1].storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE; at[1].stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    at[1].stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE; at[1].initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+    at[1].finalLayout=VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{}; sp.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp.colorAttachmentCount=1; sp.pColorAttachments=&colorRef; sp.pDepthStencilAttachment=&depthRef;
+    VkRenderPassCreateInfo rp{}; rp.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp.attachmentCount=2; rp.pAttachments=at; rp.subpassCount=1; rp.pSubpasses=&sp;
+    CHECK(vkCreateRenderPass(A.dev, &rp, nullptr, &A.rp), "renderPass");
+
+    VK_DEV_FN(A.dev, vkCreateFramebuffer);
+    for (auto view : A.views) {
+        VkImageView atv[2]={view, A.depthView};
+        VkFramebufferCreateInfo fb{}; fb.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass=A.rp; fb.attachmentCount=2; fb.pAttachments=atv; fb.width=A.extent.width; fb.height=A.extent.height; fb.layers=1;
+        VkFramebuffer f; CHECK(vkCreateFramebuffer(A.dev, &fb, nullptr, &f), "framebuffer");
+        A.fbs.push_back(f);
+    }
+    // command pool
+    VK_DEV_FN(A.dev, vkCreateCommandPool);
+    VkCommandPoolCreateInfo cp{}; cp.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cp.queueFamilyIndex=A.qf; cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    CHECK(vkCreateCommandPool(A.dev, &cp, nullptr, &A.cmdPool), "cmdPool");
+}
+
+static void initPipeline(App& A) {
+    VK_DEV_FN(A.dev, vkCreateShaderModule); VK_DEV_FN(A.dev, vkCreatePipelineLayout); VK_DEV_FN(A.dev, vkCreateGraphicsPipelines);
+    auto makeShader = [&](const char* path) {
+        auto code = readFile(path);
+        VkShaderModuleCreateInfo sm{}; sm.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        sm.codeSize=code.size(); sm.pCode=(const uint32_t*)code.data();
+        VkShaderModule m; CHECK(vkCreateShaderModule(A.dev, &sm, nullptr, &m), "shaderModule");
+        return m;
+    };
+    VkShaderModule vs = makeShader("tex.vert.spv"), fs = makeShader("tex.frag.spv");
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType=stages[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT; stages[0].module=vs; stages[0].pName="main";
+    stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module=fs; stages[1].pName="main";
+
+    VkVertexInputBindingDescription bind{}; bind.binding=0; bind.stride=32; bind.inputRate=VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription attrs[3]{};
+    attrs[0].location=0; attrs[0].binding=0; attrs[0].format=VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset=0;
+    attrs[1].location=1; attrs[1].binding=0; attrs[1].format=VK_FORMAT_R32G32B32_SFLOAT; attrs[1].offset=12;
+    attrs[2].location=2; attrs[2].binding=0; attrs[2].format=VK_FORMAT_R32G32_SFLOAT; attrs[2].offset=24;
+    VkPipelineVertexInputStateCreateInfo vi{}; vi.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount=1; vi.pVertexBindingDescriptions=&bind;
+    vi.vertexAttributeDescriptionCount=3; vi.pVertexAttributeDescriptions=attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport vp{0,0,(float)A.extent.width,(float)A.extent.height,0,1};
+    VkRect2D sc{{0,0},A.extent};
+    VkPipelineViewportStateCreateInfo vsi{}; vsi.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vsi.viewportCount=1; vsi.pViewports=&vp; vsi.scissorCount=1; vsi.pScissors=&sc;
+    VkPipelineRasterizationStateCreateInfo rs{}; rs.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode=VK_POLYGON_MODE_FILL; rs.cullMode=VK_CULL_MODE_NONE; rs.lineWidth=1;
+    VkPipelineMultisampleStateCreateInfo ms{}; ms.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{}; ds.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable=VK_TRUE; ds.depthWriteEnable=VK_TRUE; ds.depthCompareOp=VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendAttachmentState cb{}; cb.colorWriteMask=0xF; cb.blendEnable=VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cbs.attachmentCount=1; cbs.pAttachments=&cb;
+    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT, 0, 64};
+    // descriptor set：binding 0 = combined image sampler
+    VK_DEV_FN(A.dev, vkCreateDescriptorSetLayout); VK_DEV_FN(A.dev, vkCreateDescriptorPool);
+    VK_DEV_FN(A.dev, vkAllocateDescriptorSets); VK_DEV_FN(A.dev, vkUpdateDescriptorSets);
+    VkDescriptorSetLayoutBinding dsb{}; dsb.binding=0;
+    dsb.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; dsb.descriptorCount=1;
+    dsb.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dl{}; dl.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dl.bindingCount=1; dl.pBindings=&dsb;
+    CHECK(vkCreateDescriptorSetLayout(A.dev, &dl, nullptr, &A.descLayout), "descLayout");
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo dp{}; dp.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp.maxSets=1; dp.poolSizeCount=1; dp.pPoolSizes=&ps;
+    CHECK(vkCreateDescriptorPool(A.dev, &dp, nullptr, &A.descPool), "descPool");
+    VkDescriptorSetAllocateInfo da{}; da.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    da.descriptorPool=A.descPool; da.descriptorSetCount=1; da.pSetLayouts=&A.descLayout;
+    CHECK(vkAllocateDescriptorSets(A.dev, &da, &A.descSet), "allocDescSet");
+    VkDescriptorImageInfo di{}; di.sampler=A.sampler; di.imageView=A.texView; di.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet wd{}; wd.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wd.dstSet=A.descSet; wd.dstBinding=0; wd.descriptorCount=1;
+    wd.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wd.pImageInfo=&di;
+    vkUpdateDescriptorSets(A.dev, 1, &wd, 0, nullptr);
+
+    VkPipelineLayoutCreateInfo pl{}; pl.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount=1; pl.pSetLayouts=&A.descLayout;
+    pl.pushConstantRangeCount=1; pl.pPushConstantRanges=&pc;
+    CHECK(vkCreatePipelineLayout(A.dev, &pl, nullptr, &A.pipeLayout), "pipeLayout");
+    VkGraphicsPipelineCreateInfo gp{}; gp.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount=2; gp.pStages=stages; gp.pVertexInputState=&vi; gp.pInputAssemblyState=&ia;
+    gp.pViewportState=&vsi; gp.pRasterizationState=&rs; gp.pMultisampleState=&ms; gp.pDepthStencilState=&ds;
+    gp.pColorBlendState=&cbs; gp.layout=A.pipeLayout; gp.renderPass=A.rp; gp.subpass=0;
+    CHECK(vkCreateGraphicsPipelines(A.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &A.pipe), "pipeline");
+    VK_DEV_FN(A.dev, vkDestroyShaderModule);
+    vkDestroyShaderModule(A.dev, vs, nullptr); vkDestroyShaderModule(A.dev, fs, nullptr);
+}
+
+static void initMesh(App& A, const brf::Mesh& mesh) {
+    // 构造 interleaved 顶点 (pos, color)
+    std::vector<float> verts; verts.reserve(mesh.verts.size()*8);
+    for (auto& v : mesh.verts) {
+        if (v.index < 0 || (size_t)v.index >= mesh.positions.size()) continue;
+        auto& p = mesh.positions[v.index];
+        // BRF 坐标：盾牌正面在 XZ 平面（Y 是厚度）。
+        // 渲染坐标：y' = z（把高度立起来），z' = -y（厚度推深）。
+        verts.push_back(p.x); verts.push_back(p.z); verts.push_back(-p.y);
+        float r = ((v.color) & 0xFF) / 255.0f;
+        float g = ((v.color >> 8) & 0xFF) / 255.0f;
+        float b = ((v.color >> 16) & 0xFF) / 255.0f;
+        verts.push_back(r); verts.push_back(g); verts.push_back(b);
+        verts.push_back(v.uv.u); verts.push_back(v.uv.v);
+    }
+    makeBuffer(A, verts.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, A.vbuf, A.vmem);
+    upload(A, A.vbuf, A.vmem, verts.data(), verts.size()*4);
+    A.indexCount = (uint32_t)mesh.indices.size();
+    makeBuffer(A, A.indexCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, A.ibuf, A.imem);
+    upload(A, A.ibuf, A.imem, mesh.indices.data(), A.indexCount*4);
+    // bbox（渲染坐标，与顶点一致：x'=x, y'=z, z'=-y）
+    brf::Vec3 mn{1e9f,1e9f,1e9f}, mx{-1e9f,-1e9f,-1e9f};
+    for (auto& p : mesh.positions) {
+        float px=p.x, py=p.z, pz=-p.y;
+        mn.x=std::min(mn.x,px); mn.y=std::min(mn.y,py); mn.z=std::min(mn.z,pz);
+        mx.x=std::max(mx.x,px); mx.y=std::max(mx.y,py); mx.z=std::max(mx.z,pz);
+    }
+    A.mvp.resize(16); computeMVP(A.mvp, 0.0f, mn, mx);
+}
+
+static void recordCmd(App& A) {
+    VK_DEV_FN(A.dev, vkAllocateCommandBuffers); VK_DEV_FN(A.dev, vkBeginCommandBuffer);
+    VK_DEV_FN(A.dev, vkCmdBeginRenderPass); VK_DEV_FN(A.dev, vkCmdBindPipeline);
+    VK_DEV_FN(A.dev, vkCmdBindDescriptorSets);
+    VK_DEV_FN(A.dev, vkCmdPushConstants); VK_DEV_FN(A.dev, vkCmdBindVertexBuffers);
+    VK_DEV_FN(A.dev, vkCmdBindIndexBuffer); VK_DEV_FN(A.dev, vkCmdDrawIndexed);
+    VK_DEV_FN(A.dev, vkCmdEndRenderPass); VK_DEV_FN(A.dev, vkEndCommandBuffer);
+    VkCommandBufferAllocateInfo ca{}; ca.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ca.commandPool=A.cmdPool; ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount=(uint32_t)A.images.size();
+    A.cmds.resize(A.images.size());
+    CHECK(vkAllocateCommandBuffers(A.dev, &ca, A.cmds.data()), "allocCmds");
+    VkClearValue cv[2]{}; cv[0].color={{0.05f,0.06f,0.10f,1}}; cv[1].depthStencil={1.0f,0};
+    for (size_t i=0;i<A.cmds.size();i++) {
+        VkCommandBufferBeginInfo bb{}; bb.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        vkBeginCommandBuffer(A.cmds[i], &bb);
+        VkRenderPassBeginInfo rp{}; rp.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass=A.rp; rp.framebuffer=A.fbs[i]; rp.renderArea={{0,0},A.extent};
+        rp.clearValueCount=2; rp.pClearValues=cv;
+        vkCmdBeginRenderPass(A.cmds[i], &rp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipe);
+        vkCmdBindDescriptorSets(A.cmds[i], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &A.descSet, 0, nullptr);
+        vkCmdPushConstants(A.cmds[i], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, A.mvp.data());
+        VkDeviceSize off=0;
+        vkCmdBindVertexBuffers(A.cmds[i], 0, 1, &A.vbuf, &off);
+        vkCmdBindIndexBuffer(A.cmds[i], A.ibuf, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(A.cmds[i], A.indexCount, 1, 0, 0, 0);
+        vkCmdEndRenderPass(A.cmds[i]);
+        vkEndCommandBuffer(A.cmds[i]);
+    }
+}
+
+int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0); setvbuf(stderr, nullptr, _IONBF, 0);
+    if (argc < 2) { std::printf("usage: vk_mesh <file.brf> [meshName]\n"); return 1; }
+    std::fprintf(stderr, "A: 开始解析 BRF %s\n", argv[1]);
+    brf::BrfFile bf = brf::parse(argv[1]);
+    if (bf.meshes.empty()) { std::printf("FAIL BRF 里没有网格\n"); return 1; }
+    const brf::Mesh* mesh = &bf.meshes[0];
+    if (argc >= 3) {
+        for (auto& m : bf.meshes) if (m.name == argv[2]) { mesh=&m; break; }
+    }
+    std::printf("渲染网格: %s (verts=%zu tris=%zu)\n", mesh->name.c_str(), mesh->verts.size(), mesh->indices.size()/3);
+    std::fprintf(stderr, "B: 创建窗口\n");
+    App A; A.hInst = GetModuleHandleA(nullptr);
+    WNDCLASSA wc{}; wc.lpfnWndProc=wndProc; wc.hInstance=A.hInst; wc.lpszClassName="vkMeshWnd";
+    RegisterClassA(&wc);
+    A.hwnd = CreateWindowA("vkMeshWnd", "M&B 原版自研渲染验证", WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+                          200, 100, 1280, 720, nullptr, nullptr, A.hInst, nullptr);
+    std::fprintf(stderr, "C: initVk\n");
+    initVk(A);
+    std::string brfPath = argv[1];
+    size_t slash = brfPath.find_last_of("\\/");
+    std::string texPath = (slash == std::string::npos ? "" : brfPath.substr(0, slash+1)) + "..\\Textures\\" + mesh->material + ".dds";
+    std::fprintf(stderr, "C2: 加载贴图 %s\n", texPath.c_str());
+    initTexture(A, texPath.c_str());
+    std::fprintf(stderr, "D: initPipeline\n");
+    initPipeline(A);
+    std::fprintf(stderr, "E: initMesh\n");
+    initMesh(A, *mesh);
+    std::fprintf(stderr, "F: recordCmd\n");
+    recordCmd(A);
+
+    VK_DEV_FN(A.dev, vkAcquireNextImageKHR); VK_DEV_FN(A.dev, vkQueueSubmit); VK_DEV_FN(A.dev, vkQueuePresentKHR);
+    VK_DEV_FN(A.dev, vkCreateFence); VK_DEV_FN(A.dev, vkWaitForFences); VK_DEV_FN(A.dev, vkResetFences); VK_DEV_FN(A.dev, vkResetCommandBuffer);
+    A.fences.resize(A.images.size());
+    for (auto& f : A.fences) {
+        VkFenceCreateInfo fi{}; fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+        vkCreateFence(A.dev, &fi, nullptr, &f);
+    }
+    std::fprintf(stderr, "G: 进入主循环\n");
+    std::printf("窗口已创建，ESC 退出。\n");
+    MSG msg;
+    uint32_t frame = 0;
+    while (true) {
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return 0;
+            TranslateMessage(&msg); DispatchMessageA(&msg);
+        }
+        uint32_t img=0;
+        VkResult ar = vkAcquireNextImageKHR(A.dev, A.swap, UINT64_MAX, VK_NULL_HANDLE, A.fences[frame%A.fences.size()], &img);
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { std::printf("acquire=%d\n", ar); continue; }
+        vkWaitForFences(A.dev, 1, &A.fences[frame%A.fences.size()], VK_TRUE, UINT64_MAX);
+        vkResetFences(A.dev, 1, &A.fences[frame%A.fences.size()]);
+        VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkSubmitInfo si{}; si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount=1; si.pCommandBuffers=&A.cmds[img]; si.waitSemaphoreCount=0; si.pWaitDstStageMask=&ws;
+        vkQueueSubmit(A.queue, 1, &si, A.fences[frame%A.fences.size()]);
+        VkPresentInfoKHR pi{}; pi.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        pi.swapchainCount=1; pi.pSwapchains=&A.swap; pi.pImageIndices=&img;
+        vkQueuePresentKHR(A.queue, &pi);
+        frame++;
+        Sleep(1);
+    }
+}
