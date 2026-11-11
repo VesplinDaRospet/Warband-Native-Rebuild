@@ -30,7 +30,7 @@ original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
 ```
 
 > **MIT coverage**: the MIT license applies only to original code authored by the project author.
-> Full compliance policy: [COMPLIANCE.md](COMPLIANCE.md).
+> Full compliance policy, prohibited contributions, and enforcement rules: see **[COMPLIANCE.md](COMPLIANCE.md)**.
 
 ### Layout
 
@@ -122,7 +122,7 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 ```
 
 > **MIT 覆盖范围**：MIT 许可证仅适用于由本项目作者原创的代码。
-> 完整合规政策见 [COMPLIANCE.md](COMPLIANCE.md)。
+> 完整合规政策、禁止行为与执行规则见 **[COMPLIANCE.md](COMPLIANCE.md)**。
 
 ## 目录
 
