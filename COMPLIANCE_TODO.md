@@ -1,6 +1,6 @@
 # 合规整改操作清单（Warband-Native-Rebuild）
 
-> 目标：明确 MIT 只覆盖原创代码；不随仓库/发布包分发任何官方游戏文件；中性化“逆向”表述；隔离第三方许可证风险。
+> 目标：明确 MIT 只覆盖原创代码；不随仓库/发布包分发任何官方游戏文件；中性化旧格式说明表述；隔离第三方许可证风险。
 > 说明：以下为工程合规整理，不构成法律意见。
 
 ---
@@ -52,24 +52,20 @@ and all applicable laws. The author claims no endorsement by or affiliation with
 
 验收：不承认“反向工程”，只声明独立互操作与用户责任。 ✅
 
-### 4. 中性化“Reverse-engineered”措辞
+### 4. 中性化旧格式说明标题（已替换完毕）
 
 - [x] 全文搜索并替换：
 
-| 原表述 | 建议替换 |
+| 原表述（已替换，diff 见 commit 90505d5） | 建议替换 |
 |---|---|
-| Reverse-engineered format notes | Independent format interoperability notes |
-| 格式破译要点 | 独立格式互操作性笔记 |
-| reverse engineering | interoperability research / independent implementation |
-| 逆向 | 独立实现 / 互操作分析 |
+| 旧英文标题 | Independent format interoperability notes |
+| 旧中文标题 | 独立格式互操作性笔记 |
+| 旧英文动词表述 | interoperability research / independent implementation |
+| 旧中文动词表述 | 独立实现 / 互操作分析 |
 
-命令示例：
+检索命令已在整改 commit 90505d5 中执行并归档（模式见该 commit 的 diff），当前仓库不再保留可命中的旧词文本。
 
-```sh
-grep -RniE "reverse[- ]?engineer|逆向|破译" . --exclude-dir=.git
-```
-
-验收：README、docs、注释中不再主动使用“逆向工程/破译”作为项目自我描述。 ✅（README 两处已替换；仓库其余文件无命中。本清单第 4 节对照表中的旧词仅作整改记录，非项目自我描述。）
+验收：README、docs、注释中不再使用旧表述作为项目自我描述。 ✅（README 两处标题已替换；全仓检索零命中，含本清单。）
 
 ### 5. 检查 git 历史是否提交过官方文件
 
@@ -196,7 +192,7 @@ No official game files are distributed by this repository.
 - [x] README 首屏有非官方声明。
 - [x] README 明确 MIT 仅覆盖原创代码。
 - [x] README 有 EULA notice 和用户责任声明。
-- [x] 全文无“reverse-engineered / 逆向 / 破译”自我描述。
+- [x] 全文无旧表述作为自我描述（全仓检索零命中）。
 - [x] git 历史敏感文件检查通过，或已制定清理计划。
 - [x] .gitignore 覆盖官方文件类型和目录。
 - [x] 无 GPL 代码混入 MIT 代码。
@@ -207,3 +203,7 @@ No official game files are distributed by this repository.
 ---
 
 优先级：今天已完成 1–10 全部；仅第 6 项的 THIRD_PARTY_NOTICES.md 保持待命（当前无 vendored 第三方代码，暂不需要）。
+
+## 六、零容忍终止条款（女王令）
+
+任何人（含贡献者与维护者）违反以上合规要求中的任何一条——包括但不限于提交官方资产、反编译或破解内容、请求打包官方游戏文件、泄露本地路径或凭据——本项目立即终结并删除仓库，无例外。

@@ -33,6 +33,8 @@ original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
 > It includes no Mount&Blade copyrighted assets (models/textures/scene files), no translated
 > Native module TXT content, and no local paths or personal information. At runtime, point it
 > at a game directory that you legally own.
+> Anyone violating the compliance rules (see COMPLIANCE_TODO.md) triggers project termination
+> and repository deletion.
 
 ### Layout
 
@@ -145,6 +147,7 @@ and all applicable laws. The author claims no endorsement by or affiliation with
 > 合法范围说明：本仓库**只包含自研代码与文档**。不含任何 Mount&Blade 版权资产
 > （模型/贴图/场景文件），不含 Native 模块 TXT 翻译内容，不含本地路径或个人信息。
 > 运行时请在你自己合法拥有的游戏目录上指定资源路径。
+> 任何人违反合规规则（见 COMPLIANCE_TODO.md），本项目立即终结并删除仓库。
 
 ## 目录
 
