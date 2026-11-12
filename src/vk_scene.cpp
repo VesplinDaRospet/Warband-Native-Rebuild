@@ -54,7 +54,7 @@ struct App {
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipeline pipeSky = VK_NULL_HANDLE;
-    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; };
+    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; int charPart=-1; };
     std::vector<Obj> objs;
     std::vector<VkImageView> texViews;
     std::vector<std::string> texNames;
@@ -476,19 +476,39 @@ static sco::Terrain g_terrain;
 struct Char { float x=0, z=0, yaw=0.f; };
 static Char g_char;
 static sco::AiMesh g_aiMesh;
-// 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf）
+// 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf / meshes_face_gen.brf）
 struct CharSkin {
     bool ok = false;
-    brf::BrfFile skelFile, animFile, bodyFile;
+    brf::BrfFile skelFile, animFile, bodyFile, faceFile;
     brf::Skeleton* skel = nullptr;
     brf::SkeletonAnim* anim = nullptr;
     brf::Mesh* body = nullptr;
+    // 部件列表：0=body 蒙皮；其余为无蒙皮的附属部件，整体跟随 bone（骨骼全局 × 固定旋转）
+    struct Part { const brf::Mesh* mesh = nullptr; int bone = -1; std::string diff = "snow"; bool mirror = false; bool isHead = false; };
+    std::vector<Part> parts;
     std::vector<skin::M44> bind;
     float t = 0.f;
     size_t frame = 0;
     std::string diffuse = "snow";
 };
 static CharSkin g_charSkin;
+// 肢体部件（小腿/手）约定：part x→骨+z，part y→骨-y（脚趾/掌心翻正），part z→骨+x（沿肢体长轴）
+static skin::M44 g_partFixLimb = []() {
+    skin::M44 m = skin::identity();
+    m.m[0] = 0.f; m.m[1] = 0.f; m.m[2] = 1.f;   // col0=(0,0,1)
+    m.m[4] = 0.f; m.m[5] = -1.f; m.m[6] = 0.f;  // col1=(0,-1,0)
+    m.m[8] = 1.f; m.m[9] = 0.f; m.m[10] = 0.f;  // col2=(1,0,0)
+    return m;
+}();
+// 头部约定（male_head 是半脸网格，z=朝上、y=脸正前方、x=半宽）：
+// part x→骨-z（世界左侧），part y→骨-y（世界 +z 脸），part z→骨+x（世界 +y 头顶）
+static skin::M44 g_partFixHead = []() {
+    skin::M44 H = skin::identity();
+    H.m[0] = 0.f; H.m[1] = 0.f; H.m[2] = -1.f;  // col0=(0,0,-1)
+    H.m[4] = 0.f; H.m[5] = -1.f; H.m[6] = 0.f;   // col1=(0,-1,0)
+    H.m[8] = 1.f; H.m[9] = 0.f; H.m[10] = 0.f;   // col2=(1,0,0)
+    return H;
+}();
 static int32_t g_lastFace = -1;
 static std::vector<int32_t> g_path; static size_t g_pathIdx = 0; static bool g_wasG = false;
 
@@ -841,6 +861,7 @@ static void loadCharSkin(const std::string& commonRes) {
         g_charSkin.skelFile = brf::parse(commonRes + "/skeletons.brf");
         g_charSkin.animFile = brf::parse(commonRes + "/ani_man_walk.brf");
         g_charSkin.bodyFile = brf::parse(commonRes + "/body_meshes.brf");
+        g_charSkin.faceFile = brf::parse(commonRes + "/meshes_face_gen.brf");
         for (auto& s : g_charSkin.skelFile.skeletons) if (s.name == "skel_human") { g_charSkin.skel = &s; break; }
         for (auto& a : g_charSkin.animFile.anims) if (a.name == "man_walk") { g_charSkin.anim = &a; break; }
         for (auto& m : g_charSkin.bodyFile.meshes) if (m.name == "man_body") { g_charSkin.body = &m; break; }
@@ -850,48 +871,133 @@ static void loadCharSkin(const std::string& commonRes) {
             return;
         }
         skin::bindGlobals(*g_charSkin.skel, g_charSkin.bind);
-        auto dit = g_materialDiffuse.find(g_charSkin.body->material);
-        if (dit != g_materialDiffuse.end() && !dit->second.empty() && dit->second != "none")
-            g_charSkin.diffuse = dit->second;
+        auto diffFor = [&](const std::string& mat, const std::string& fallback) -> std::string {
+            auto dit = g_materialDiffuse.find(mat);
+            if (dit != g_materialDiffuse.end() && !dit->second.empty() && dit->second != "none") return dit->second;
+            return fallback;
+        };
+        auto boneIdx = [&](const std::string& name) -> int {
+            for (size_t i = 0; i < g_charSkin.skel->bones.size(); i++)
+                if (g_charSkin.skel->bones[i].name == name) return (int)i;
+            return -1;
+        };
+        auto findMesh = [&](std::vector<brf::Mesh>& vec, const std::string& name) -> brf::Mesh* {
+            for (auto& m : vec) if (m.name == name) return &m;
+            return nullptr;
+        };
+        g_charSkin.diffuse = diffFor(g_charSkin.body->material, "snow");
+        g_charSkin.parts.clear();
+        g_charSkin.parts.push_back({g_charSkin.body, -1, g_charSkin.diffuse});
+        // 附属部件：无蒙皮，整体跟随对应骨骼（部件空间长轴 +z → 骨局部 +x）
+        auto addPart = [&](std::vector<brf::Mesh>& vec, const std::string& mesh, const std::string& bone,
+                           const std::string& fallbackDiff, bool mirror = false, bool isHead = false) {
+            brf::Mesh* m = findMesh(vec, mesh);
+            int bi = boneIdx(bone);
+            if (!m || bi < 0) { std::fprintf(stderr, "缺部件 %s/%s，跳过\n", mesh.c_str(), bone.c_str()); return; }
+            g_charSkin.parts.push_back({m, bi, diffFor(m->material, fallbackDiff), mirror, isHead});
+        };
+        addPart(g_charSkin.bodyFile.meshes, "man_calf_l", "calf.L", g_charSkin.diffuse);
+        addPart(g_charSkin.bodyFile.meshes, "man_calf_r", "calf.R", g_charSkin.diffuse);
+        addPart(g_charSkin.bodyFile.meshes, "m_handL", "hand.L", g_charSkin.diffuse);
+        addPart(g_charSkin.bodyFile.meshes, "m_handR", "hand.R", g_charSkin.diffuse);
+        addPart(g_charSkin.faceFile.meshes, "male_head", "head", "manface_young", true, true); // 头网格是半脸，引擎镜像补全
         g_charSkin.ok = true;
-        std::fprintf(stderr, "原版角色: %s(%zu骨) + %s(%zu帧) + %s(%zu顶点/%u三角形) 贴图=%s\n",
+        std::fprintf(stderr, "原版角色: %s(%zu骨) + %s(%zu帧) + 部件%zu: ",
             g_charSkin.skel->name.c_str(), g_charSkin.skel->bones.size(),
-            g_charSkin.anim->name.c_str(), g_charSkin.anim->frames.size(),
-            g_charSkin.body->name.c_str(), g_charSkin.body->positions.size(),
-            (uint32_t)(g_charSkin.body->indices.size()/3), g_charSkin.diffuse.c_str());
+            g_charSkin.anim->name.c_str(), g_charSkin.anim->frames.size(), g_charSkin.parts.size());
+        for (auto& p : g_charSkin.parts)
+            std::fprintf(stderr, "[%s/%s] ", p.mesh->name.c_str(), p.diff.c_str());
+        std::fprintf(stderr, "\n");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "原版角色加载失败: %s，回退占位 box 人\n", e.what());
         g_charSkin.ok = false;
     }
 }
 
-// 蒙皮一帧，生成 11-float 渲染顶点（角色本地：前方 +y，脚底 z≈0）
-// tPose=false 走骨骼蒙皮；顶点映射与 T-pose 分支完全相同（朝向公式勿再改）
-static void buildCharVerts(std::vector<float>& V, bool tPose) {
-    V.clear();
-    const brf::Mesh& m = *g_charSkin.body;
+// 生成一帧全部部件的 11-float 渲染顶点（角色本地：前方 +y，脚底统一贴地 z≈0）
+static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) {
+    out.assign(g_charSkin.parts.size(), {});
     std::vector<skin::M44> ag, skm;
-    std::vector<brf::Vec3> op, on;
     if (!tPose) {
         const brf::AnimFrame& fr = g_charSkin.anim->frames[g_charSkin.frame % g_charSkin.anim->frames.size()];
         skin::animGlobals(*g_charSkin.skel, fr, ag);
         skin::skinMatrices(g_charSkin.bind, ag, skm);
-        skin::skinMesh(m, skm, op, on);
     }
-    float minZ = 1e9f;
-    for (size_t i = 0; i < m.verts.size(); i++) {
-        int idx = m.verts[i].index;
-        if (idx < 0 || (size_t)idx >= m.positions.size()) continue;
-        brf::Vec3 p = tPose ? m.positions[idx] : op[idx];
-        brf::Vec3 n = tPose ? m.verts[i].normal : on[i];
-        V.push_back(p.x); V.push_back(p.z); V.push_back(p.y);
-        uint32_t c = m.verts[i].color;
-        V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
-        V.push_back(n.x); V.push_back(n.z); V.push_back(n.y);
-        V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
-        minZ = std::min(minZ, p.y);
+    struct Staged { std::vector<brf::Vec3> pos, nrm; };
+    std::vector<Staged> st(g_charSkin.parts.size());
+    float minY = 1e9f;
+    for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
+        const brf::Mesh& m = *g_charSkin.parts[pi].mesh;
+        Staged& s = st[pi];
+        s.nrm.resize(m.verts.size());
+        if (g_charSkin.parts[pi].bone < 0) {
+            s.pos.resize(m.positions.size());
+            for (size_t i = 0; i < m.positions.size(); i++) s.pos[i] = m.positions[i];
+            if (!tPose) {
+                std::vector<brf::Vec3> skpos, sknrm;
+                skin::skinMesh(m, skm, skpos, sknrm);
+                s.pos = std::move(skpos); s.nrm = std::move(sknrm);
+            } else {
+                for (size_t i = 0; i < m.verts.size(); i++) s.nrm[i] = m.verts[i].normal;
+            }
+        } else {
+            const skin::M44& fix = g_charSkin.parts[pi].isHead ? g_partFixHead : g_partFixLimb;
+            skin::M44 M = tPose ? skin::mul(g_charSkin.bind[g_charSkin.parts[pi].bone], fix)
+                                : skin::mul(ag[g_charSkin.parts[pi].bone], fix);
+            if (!g_charSkin.parts[pi].mirror) {
+                s.pos.resize(m.positions.size());
+                for (size_t i = 0; i < m.positions.size(); i++) { s.pos[i] = m.positions[i]; skin::xformPos(M, s.pos[i]); }
+                for (size_t i = 0; i < m.verts.size(); i++) {
+                    s.nrm[i] = m.verts[i].normal;
+                    skin::xformDir(M, s.nrm[i]);
+                    float nl = sqrtf(s.nrm[i].x*s.nrm[i].x + s.nrm[i].y*s.nrm[i].y + s.nrm[i].z*s.nrm[i].z);
+                    if (nl > 1e-6f) { s.nrm[i].x/=nl; s.nrm[i].y/=nl; s.nrm[i].z/=nl; }
+                }
+            } else {
+                // 镜像必须在部件空间完成，再一起跟随骨骼动画：
+                // 前半块 = M*(-x)（原半脸在 -x，绕序需反），后半块 = M*(x)（+x 侧）
+                s.pos.resize(m.positions.size() * 2);
+                for (size_t i = 0; i < m.positions.size(); i++) {
+                    brf::Vec3 q = m.positions[i]; q.x = -q.x; skin::xformPos(M, q); s.pos[i] = q;
+                    q = m.positions[i]; skin::xformPos(M, q); s.pos[m.positions.size() + i] = q;
+                }
+                s.nrm.resize(m.verts.size() * 2);
+                for (size_t i = 0; i < m.verts.size(); i++) {
+                    brf::Vec3 n = m.verts[i].normal; n.x = -n.x; skin::xformDir(M, n);
+                    float nl = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+                    if (nl > 1e-6f) { n.x/=nl; n.y/=nl; n.z/=nl; }
+                    s.nrm[i] = n;
+                    n = m.verts[i].normal; skin::xformDir(M, n);
+                    nl = sqrtf(n.x*n.x + n.y*n.y + n.z*n.z);
+                    if (nl > 1e-6f) { n.x/=nl; n.y/=nl; n.z/=nl; }
+                    s.nrm[m.verts.size() + i] = n;
+                }
+            }
+        }
+        for (auto& p : s.pos) minY = std::min(minY, p.y);
     }
-    for (size_t i = 0; i < V.size(); i += 11) V[i+2] -= minZ; // 脚底贴地
+    for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
+        const brf::Mesh& m = *g_charSkin.parts[pi].mesh;
+        Staged& s = st[pi];
+        std::vector<float>& V = out[pi];
+        V.clear();
+        size_t nHalf = g_charSkin.parts[pi].mirror ? 2u : 1u;
+        V.reserve(m.verts.size() * 11 * nHalf);
+        for (size_t h = 0; h < nHalf; h++) {
+            for (size_t i = 0; i < m.verts.size(); i++) {
+                int idx = m.verts[i].index;
+                if (idx < 0 || (size_t)idx >= m.positions.size()) continue;
+                brf::Vec3& p = s.pos[h * m.positions.size() + idx];
+                brf::Vec3 n = (h * m.verts.size() + i < s.nrm.size()) ? s.nrm[h * m.verts.size() + i]
+                                                                      : brf::Vec3{0.f, 0.f, 1.f};
+                V.push_back(p.x); V.push_back(p.z); V.push_back(p.y - minY);
+                uint32_t c = m.verts[i].color;
+                V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
+                V.push_back(n.x); V.push_back(n.z); V.push_back(n.y);
+                V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
+            }
+        }
+    }
 }
 
 static void makeBoxCharObj(App& A) {
@@ -919,34 +1025,57 @@ static void makeBoxCharObj(App& A) {
 static bool charTposeDebug() { static bool v = getenv("VK_TPOSE") != nullptr; return v; }
 static void makeCharObj(App& A, std::set<std::string>& needDds) {
     if (!g_charSkin.ok) { makeBoxCharObj(A); return; }
-    std::vector<float> V;
-    buildCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
-    App::Obj obj;
-    obj.diffName = g_charSkin.diffuse;
-    needDds.insert(obj.diffName);
-    obj.charAnim = true;
-    obj.model.assign(16, 0.f);
-    makeBuffer(A, V.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
-    upload(A, obj.vb, obj.vm, V.data(), V.size()*4);
-    obj.idxCount = (uint32_t)g_charSkin.body->indices.size();
-    makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
-    upload(A, obj.ib, obj.im, g_charSkin.body->indices.data(), obj.idxCount*4);
-    A.objs.push_back(std::move(obj));
+    std::vector<std::vector<float>> V;
+    buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     float mnx=1e9f,mny=1e9f,mnz=1e9f,mxx=-1e9f,mxy=-1e9f,mxz=-1e9f;
-    for (size_t i=0;i+2<V.size();i+=11){mnx=std::min(mnx,V[i]);mxx=std::max(mxx,V[i]);mny=std::min(mny,V[i+1]);mxy=std::max(mxy,V[i+1]);mnz=std::min(mnz,V[i+2]);mxz=std::max(mxz,V[i+2]);}
-    std::fprintf(stderr, "原版角色已上屏 顶点=%zu 三角形=%u bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
-        V.size()/11, (uint32_t)(g_charSkin.body->indices.size()/3), mnx,mxx,mny,mxy,mnz,mxz);
+    for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
+        const brf::Mesh& mesh = *g_charSkin.parts[pi].mesh;
+        App::Obj obj;
+        obj.diffName = g_charSkin.parts[pi].diff;
+        needDds.insert(obj.diffName);
+        obj.charAnim = true;
+        obj.charPart = (int)pi;
+        obj.model.assign(16, 0.f);
+        makeBuffer(A, V[pi].size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
+        upload(A, obj.vb, obj.vm, V[pi].data(), V[pi].size()*4);
+        std::vector<uint32_t> idxs;
+        if (g_charSkin.parts[pi].mirror) { // H(det=-1) 整体翻转绕序：base 半脸(-x)用原绕序，镜像半脸(+x)逆序
+            uint32_t base = (uint32_t)(V[pi].size() / 22); // 原半边顶点数
+            idxs.reserve(mesh.indices.size() * 2);
+            for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+                idxs.push_back(mesh.indices[i]);
+                idxs.push_back(mesh.indices[i+1]);
+                idxs.push_back(mesh.indices[i+2]);
+                idxs.push_back(base + mesh.indices[i]);
+                idxs.push_back(base + mesh.indices[i+2]);
+                idxs.push_back(base + mesh.indices[i+1]);
+            }
+        } else {
+            idxs = mesh.indices;
+        }
+        obj.idxCount = (uint32_t)idxs.size();
+        makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
+        upload(A, obj.ib, obj.im, idxs.data(), obj.idxCount*4);
+        A.objs.push_back(std::move(obj));
+        for (size_t i = 0; i + 2 < V[pi].size(); i += 11) {
+            mnx=std::min(mnx,V[pi][i]); mxx=std::max(mxx,V[pi][i]);
+            mny=std::min(mny,V[pi][i+1]); mxy=std::max(mxy,V[pi][i+1]);
+            mnz=std::min(mnz,V[pi][i+2]); mxz=std::max(mxz,V[pi][i+2]);
+        }
+    }
+    std::fprintf(stderr, "原版角色已上屏 部件=%zu bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
+        g_charSkin.parts.size(), mnx,mxx,mny,mxy,mnz,mxz);
 }
 static void updateCharAnim(App& A, float dt, bool moving) {
     if (!g_charSkin.ok) return;
     if (moving) g_charSkin.t += dt * 30.f * (GetAsyncKeyState(VK_SHIFT) & 0x8000 ? 1.8f : 1.f);
     else g_charSkin.t = 0.f;
     g_charSkin.frame = (size_t)g_charSkin.t;
-    std::vector<float> V;
-    buildCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
+    std::vector<std::vector<float>> V;
+    buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     for (auto& o : A.objs) {
-        if (!o.charAnim) continue;
-        upload(A, o.vb, o.vm, V.data(), V.size()*4);
+        if (!o.charAnim || o.charPart < 0 || (size_t)o.charPart >= V.size()) continue;
+        upload(A, o.vb, o.vm, V[o.charPart].data(), V[o.charPart].size()*4);
     }
 }
 static void setCharModel(App::Obj& o, const Char& ch) {
