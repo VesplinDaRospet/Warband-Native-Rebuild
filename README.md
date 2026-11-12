@@ -34,7 +34,9 @@ original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
 
 ### World map / 大地图
 
-`vk_map` parses a module's `map.txt` (vertex + triangle mesh, each triangle tagged with a terrain code) and renders the campaign map, grouping triangles by terrain type and applying the matching ground texture. Settlement icons are placed from `map_icons.txt` + `parties.txt`; clicking one launches `vk_scene` for that settlement's scene (`M` returns to the map). Camera: **WASD** pan, **QE** zoom, **arrow keys** rotate, **ESC** exit. **Click** anywhere on walkable land to move the yellow marker along a BFS path over shared triangle edges; water and river triangles are impassable.
+`vk_map` parses a module's `map.txt` (vertex + triangle mesh, each triangle tagged with a terrain code) and renders the campaign map, grouping triangles by terrain type and applying the matching ground texture. `map_icons.txt` / `parties.txt` / `party_templates.txt` are decoded with the official Module System field order (party icon = `flags & 0xff`, position = tokens 18/19). The player party is a cyan badge, AI parties are red badges, and settlement icons use the module author's own icons.
+
+Controls: **WASD** moves the player party in real time (**Shift** speeds up, impassable water/river slides), **click** paths to a point (yellow destination marker), clicking a settlement marches there and auto-enters its scene (`M` returns to the map, keeping the party position), **Space** pauses game time, **QE** zooms with a proportional camera height, **arrow keys** rotate, **ESC** exits. AI parties patrol around their spawn points; touching one triggers an encounter notification (battle comes later).
 
 ```
 vk_map "<module>\map.txt" "<game root>\Textures"
@@ -110,7 +112,8 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 - [x] v0.2-2 true terrain blending: single ground mesh with 3 weighted textures + leveling vertex colors
 - [x] v0.3 campaign map: `map.txt` renderer with terrain-coded texturing and click-to-move BFS pathfinding
 - [x] v0.4 map↔scene loop: settlement icons from `map_icons.txt`/`parties.txt`, click to enter the matching `.sco` scene, `M` returns to the map
-- [ ] Next: map party icons / scene interaction, then the TXT-module rewrite
+- [x] v0.5 map party system: real-time player party movement, camera follow, game-time/pause HUD, AI patrol parties, encounter trigger, minimum-screen-size party/settlement badges
+- [ ] Next: encounters/battle scenes or scene interaction (entries/doors), then the TXT-module rewrite
 
 ### License
 
@@ -144,7 +147,9 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 
 ## 大地图 / World map
 
-`vk_map` 解析模组的 `map.txt`（顶点 + 三角形网格，每个三角形带地形码），按地形分组贴图渲染战役大地图。定居点图标按 `map_icons.txt` + `parties.txt` 摆放；点击定居点会启动 `vk_scene` 加载对应场景（按 `M` 返回大地图）。相机：**WASD** 平移，**QE** 缩放，**方向键** 旋转，**ESC** 退出。**点击**可走陆地上的任意位置，黄色标记沿三角形共享边做 BFS 寻路移动；水域与河流不可通行。
+`vk_map` 解析模组的 `map.txt`（顶点 + 三角形网格，每个三角形带地形码），按地形分组贴图渲染战役大地图。`map_icons.txt` / `parties.txt` / `party_templates.txt` 按官方 Module System 的字段序解码（队伍图标 = `flags & 0xff`，坐标 = 第 18/19 个 token）。玩家队伍显示为青色圆标，AI 野队为红色圆标，定居点使用模组作者自带的图标。
+
+操作：**WASD** 实时行军（**Shift** 加速，水域/河流滑墙），**点击**寻路（黄色目的地标记），点定居点会行军过去并自动进城（场景按 `M` 返回，队伍位置带回大地图），**空格**暂停游戏时间，**QE** 缩放（镜头高度按比例同步抬升），**方向键** 旋转，**ESC** 退出。AI 野队绕出生点巡逻，撞上会触发遭遇提示（战斗后续版本接上）。
 
 ```
 vk_map "<模组目录>\map.txt" "<游戏根目录>\Textures"
@@ -219,7 +224,8 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 - [x] v0.2-2 地形真混合：单地面网格三贴图加权混合 + leveling 顶点色
 - [x] v0.3 战役大地图：`map.txt` 渲染（按地形码贴图）+ 点击寻路（BFS）
 - [x] v0.4 地图↔场景闭环：`map_icons.txt`/`parties.txt` 定居点图标，点击进入对应 `.sco` 场景，按 `M` 回地图
-- [ ] 下一步：地图队伍图标 / 场景交互，之后是 TXT 模块重写
+- [x] v0.5 地图队伍系统：玩家队伍实时行军、镜头跟随、游戏时间/暂停 HUD、AI 野队巡逻、遭遇触发、队伍/定居点最小屏占比图标
+- [ ] 下一步：遭遇/战斗场景，或场景交互（出入口/门），之后是 TXT 模块重写
 
 ## 许可证
 

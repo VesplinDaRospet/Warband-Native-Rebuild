@@ -1656,6 +1656,8 @@ int main(int argc, char** argv) {
     if (argc < 5) { std::printf("usage: vk_scene <scene.sco> <scene_props.txt> <CommonRes目录> <Textures目录> [map.txt mapTextures fallbackTextures]\n"); return 1; }
     std::string mapReturnArgs;
     if (argc >= 7) mapReturnArgs = "\"" + std::string(argv[5]) + "\" \"" + std::string(argv[6]) + "\"";
+    // vk_map 进城时会把队伍坐标放在 argv[8]/argv[9]，M 回地图时原样带回
+    if (argc >= 10) mapReturnArgs += " \"" + std::string(argv[8]) + "\" \"" + std::string(argv[9]) + "\"";
     std::fprintf(stderr, "A: 解析场景 %s\n", argv[1]);
     App A; A.hInst = GetModuleHandleA(nullptr);
     WNDCLASSA wc{}; wc.lpfnWndProc=wndProc; wc.hInstance=A.hInst; wc.lpszClassName="vkSceneWnd";

@@ -139,9 +139,18 @@ static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const fl
     pc[20] = 70.f; pc[21] = 300.f;    // 雾起点/终点（世界距离）
 }
 
+static void setTitleUtf8(HWND h, const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (n <= 0) return;
+    std::vector<wchar_t> w((size_t)n);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    SetWindowTextW(h, w.data());
+}
 static POINT g_click{-1,-1};
+static bool g_paused = false; // 空格暂停/继续游戏时间
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_CLOSE || (msg == WM_KEYDOWN && w == VK_ESCAPE)) PostQuitMessage(0);
+    if (msg == WM_KEYDOWN && w == VK_SPACE) g_paused = !g_paused;
     if (msg == WM_LBUTTONDOWN) { g_click.x = (short)(l & 0xFFFF); g_click.y = (short)((l >> 16) & 0xFFFF); }
     return DefWindowProcA(h, msg, w, l);
 }
@@ -206,10 +215,16 @@ static void initTextures(App& A, const std::string& ddsDir, const std::vector<st
     sc.maxLod=1.0f;
     CHECK(vkCreateSampler(A.dev, &sc, nullptr, &A.sampler), "sampler");
     for (auto& n : names) {
-        std::string path = ddsDir + "\\" + n + ".dds";
         dds::Image img;
-        try { img = dds::load(path); }
-        catch (const std::exception& e) { std::fprintf(stderr, "贴图缺失 %s（%s），跳过\n", path.c_str(), e.what()); continue; }
+        if (n == "white") {
+            // 程序化 4x4 纯白贴图：徽标/标记用，颜色完全由顶点色决定
+            img.width = 4; img.height = 4;
+            img.rgba.assign(4*4*4, 255);
+        } else {
+            std::string path = ddsDir + "\\" + n + ".dds";
+            try { img = dds::load(path); }
+            catch (const std::exception& e) { std::fprintf(stderr, "贴图缺失 %s（%s），跳过\n", path.c_str(), e.what()); continue; }
+        }
         VkBuffer stage; VkDeviceMemory smem;
         makeBuffer(A, img.rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stage, smem);
         upload(A, stage, smem, img.rgba.data(), img.rgba.size());
@@ -381,59 +396,100 @@ static void initVk(App& A) {
 #include <queue>
 #include <unordered_map>
 
-// ---------- CV War 定居点（town/castle/village）与地图图标 ----------
-struct Settlement {
-    std::string id, name, scene, meshName;
-    float x=0, y=0, scale=1.f;
-    size_t iconIdx=0;
-};
+// ---------- CV War 地图数据：map_icons / parties / party_templates ----------
+// 字段序来自 Taleworlds 官方 Module System 的 process 脚本：
+//   map_icons：  name flags mesh scale [menu/trigger 续行]
+//   parties：    1 <i> <i> p_<id> <name> <flags> <menu> <template> <faction>
+//                <personality> <personality> <ai_bhvr> <ai_target> <ai_target>
+//                <默认x> <默认y> <默认x> <默认y> <x> <y> 0.0 <stacks...>
+//   图标 = flags & 0xff（pf_icon_mask），坐标 = 第 18/19 个 token
+struct IconDef { std::string mesh; float scale=0.35f; };
 
-static std::vector<Settlement> loadSettlements(const std::string& moduleDir) {
-    std::vector<Settlement> out;
-    std::map<std::string, std::pair<std::string,float>> icons; // map_icons 名 -> (mesh, scale)
-    {
-        std::ifstream f(moduleDir + "\\map_icons.txt");
-        std::string line; std::getline(f, line); int n; f >> n;
-        while (std::getline(f, line)) {
-            if (line.empty()) continue;
-            std::istringstream ss(line);
-            std::string name; int flags; std::string mesh; float scale=0.35f;
-            if (!(ss >> name >> flags >> mesh)) continue;
-            ss >> scale;
-            icons[name] = {mesh, scale};
-        }
+static std::vector<IconDef> loadMapIcons(const std::string& moduleDir) {
+    std::vector<IconDef> out;
+    std::ifstream f(moduleDir + "\\map_icons.txt");
+    std::string line; std::getline(f, line); // map_icons_file version 1
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        char c = line[0];
+        // 入口行以字母/下划线开头；-70 开头的触发器续行直接跳过
+        if (!(c=='_' || (c>='a'&&c<='z') || (c>='A'&&c<='Z'))) continue;
+        std::istringstream ss(line);
+        IconDef ic; std::string name; int flags;
+        if (!(ss >> name >> flags >> ic.mesh)) continue;
+        ss >> ic.scale;
+        out.push_back(ic);
     }
-    {
-        std::ifstream f(moduleDir + "\\parties.txt");
-        std::string line; std::getline(f, line);
-        while (std::getline(f, line)) {
-            std::istringstream ss(line);
-            std::vector<std::string> tok; std::string t;
-            while (ss >> t) tok.push_back(t);
-            if (tok.size() < 15) continue;
-            const std::string& pid = tok[3];
-            std::string scene, icon;
-            if (pid.rfind("p_town_", 0) == 0) {
-                std::string num = pid.substr(7);
-                scene = "scn_town_" + num + "_center";
-                icon = "moe_map_town_a";
-            } else if (pid.rfind("p_castle_", 0) == 0) {
-                std::string num = pid.substr(9);
-                scene = "scn_castle_" + num + "_exterior";
-                icon = "moe_map_castle_a";
-            } else if (pid.rfind("p_village_", 0) == 0) {
-                std::string num = pid.substr(10);
-                scene = "scn_village_" + num;
-                icon = "moe_map_village_a";
-            } else continue;
-            auto it = icons.find(icon);
-            if (it == icons.end()) continue;
-            Settlement s;
-            s.id = pid; s.name = tok[4]; s.scene = scene;
-            s.meshName = it->second.first; s.scale = it->second.second;
-            s.x = (float)atof(tok[14].c_str()); s.y = (float)atof(tok[15].c_str());
-            out.push_back(std::move(s));
-        }
+    return out;
+}
+
+struct PartyRec {
+    std::string id, name;
+    uint64_t flags = 0;
+    int icon = 0, templateNo = 0, faction = 0, personality = 0, aiBehavior = 0;
+    float x = 0, y = 0;
+};
+static std::vector<PartyRec> loadParties(const std::string& moduleDir) {
+    std::vector<PartyRec> out;
+    std::ifstream f(moduleDir + "\\parties.txt");
+    std::string line; std::getline(f, line); // partiesfile version 1
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        std::vector<std::string> tok; std::string t;
+        while (ss >> t) tok.push_back(t);
+        if (tok.size() < 20) continue;
+        PartyRec p;
+        p.id = tok[3]; p.name = tok[4];
+        p.flags = strtoull(tok[5].c_str(), nullptr, 10);
+        p.icon = (int)(p.flags & 0xff);            // pf_icon_mask
+        p.templateNo = atoi(tok[7].c_str());
+        p.faction = atoi(tok[8].c_str());
+        p.personality = atoi(tok[9].c_str());
+        p.aiBehavior = atoi(tok[11].c_str());
+        p.x = (float)atof(tok[18].c_str());        // 真实坐标是第 18/19 个 token
+        p.y = (float)atof(tok[19].c_str());
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
+struct TemplateDef { std::string id, name; int icon=0; };
+static std::vector<TemplateDef> loadPartyTemplates(const std::string& moduleDir) {
+    std::vector<TemplateDef> out;
+    std::ifstream f(moduleDir + "\\party_templates.txt");
+    std::string line; std::getline(f, line); // partytemplatesfile version 1
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        TemplateDef t; uint64_t flags = 0;
+        if (!(ss >> t.id >> t.name >> flags)) continue;
+        t.icon = (int)(flags & 0xff);              // 模板图标同样在 flags 低 8 位
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
+// 定居点 = parties.txt 里的 town/castle/village；场景名用作者自己的 CV War 布局
+struct Settlement {
+    std::string id, name, scene;
+    int icon = 0;
+    float x = 0, y = 0;
+    size_t iconIdx = 0;
+};
+static std::vector<Settlement> loadSettlements(const std::vector<PartyRec>& parties) {
+    std::vector<Settlement> out;
+    for (const auto& p : parties) {
+        std::string scene;
+        if (p.id.rfind("p_town_", 0) == 0) {
+            scene = "scn_town_" + p.id.substr(7) + "_center";
+        } else if (p.id.rfind("p_castle_", 0) == 0) {
+            scene = "scn_castle_" + p.id.substr(9) + "_exterior";
+        } else if (p.id.rfind("p_village_", 0) == 0) {
+            scene = "scn_village_" + p.id.substr(10);
+        } else continue;
+        Settlement s;
+        s.id = p.id; s.name = p.name; s.scene = scene;
+        s.icon = p.icon; s.x = p.x; s.y = p.y;
+        out.push_back(std::move(s));
     }
     return out;
 }
@@ -464,6 +520,8 @@ struct MapObj {
     VkDescriptorSet descSet=VK_NULL_HANDLE;
     std::vector<float> pc;   // mvp 16 floats
     std::vector<float> model; // 可选 16 floats（标记物）
+    float iconBaseScale=1.f, iconDim=1.f; // 图标基础缩放与网格最大水平尺寸（动态最小屏占）
+    bool isIcon=false;       // 调试 VK_MAP_ICONS_ONLY 时只画图标
 };
 
 static void initMapPipeline(App& A) {
@@ -563,49 +621,68 @@ static void buildMapObjs(App& A, const MapData& md, std::vector<MapObj>& objs) {
     }
 }
 
-// 定居点图标：把 moe_map_icons.brf 的网格平铺在地图平面上（x'=x*s, y'=z*s, z=2）
-static void buildSettlementIcons(App& A, std::vector<Settlement>& ss,
-                                 const std::string& moduleDir, std::vector<MapObj>& objs) {
-    std::map<std::string, brf::Mesh> meshes;
+// 地图图标：把 moe_map_icons.brf 的网格平铺在地图平面上（x'=x*s, y'=z*s）
+static bool loadIconMeshes(const std::string& moduleDir, std::map<std::string, brf::Mesh>& meshes) {
     try {
         brf::BrfFile bf = brf::parse(moduleDir + "\\Resource\\moe_map_icons.brf");
         for (auto& m : bf.meshes) meshes[m.name] = std::move(m);
+        return true;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "图标 brf 解析失败: %s\n", e.what());
-        return;
+        return false;
     }
-    auto ti = A.texIndex.find("fake_houses");
-    VkDescriptorSet iconDesc = A.texSets[ti != A.texIndex.end() ? ti->second : 0];
-    for (auto& s : ss) {
-        auto it = meshes.find(s.meshName);
-        if (it == meshes.end()) { std::fprintf(stderr, "缺图标网格 %s（%s）\n", s.meshName.c_str(), s.id.c_str()); continue; }
-        auto& m = it->second;
-        std::vector<float> verts; std::vector<uint32_t> idx;
-        verts.reserve(m.verts.size()*11);
-        for (auto& v : m.verts) {
-            if (v.index < 0 || (size_t)v.index >= m.positions.size()) continue;
-            auto& p = m.positions[(size_t)v.index];
-            verts.push_back(p.x*s.scale); verts.push_back(p.z*s.scale); verts.push_back(2.f);
-            verts.push_back(1.f); verts.push_back(1.f); verts.push_back(1.f);
-            verts.push_back(0.f); verts.push_back(0.f); verts.push_back(1.f);
-            verts.push_back(v.uv.u); verts.push_back(v.uv.v);
-        }
-        // 按原始索引复制时顶点顺序一致，直接沿用网格索引
-        idx.assign(m.indices.begin(), m.indices.end());
-        MapObj o;
-        makeBuffer(A, verts.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, o.vb, o.vm);
-        upload(A, o.vb, o.vm, verts.data(), verts.size()*4);
-        o.idxCount = (uint32_t)idx.size();
-        makeBuffer(A, o.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, o.ib, o.im);
-        upload(A, o.ib, o.im, idx.data(), o.idxCount*4);
-        o.descSet = iconDesc;
-        o.pc.resize(16, 0.f);
-        float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, s.x,s.y,2.f,1};
-        o.model.assign(M, M+16);
-        s.iconIdx = objs.size();
-        objs.push_back(std::move(o));
+}
+static size_t makeIconObj(App& A, const std::map<std::string, brf::Mesh>& meshes,
+                          VkDescriptorSet desc, const std::string& meshName, float scale,
+                          float x, float y, float z, std::vector<MapObj>& objs) {
+    auto it = meshes.find(meshName);
+    if (it == meshes.end()) { std::fprintf(stderr, "缺图标网格 %s\n", meshName.c_str()); return SIZE_MAX; }
+    auto& m = it->second;
+    std::vector<float> verts; std::vector<uint32_t> idx;
+    verts.reserve(m.verts.size()*11);
+    float minx=1e30f, maxx=-1e30f, miny=1e30f, maxy=-1e30f;
+    for (auto& v : m.verts) {
+        if (v.index < 0 || (size_t)v.index >= m.positions.size()) continue;
+        auto& p = m.positions[(size_t)v.index];
+        minx=std::min(minx,p.x); maxx=std::max(maxx,p.x);
+        miny=std::min(miny,p.z); maxy=std::max(maxy,p.z);
     }
-    std::fprintf(stderr, "定居点图标 %zu/%zu 个已上屏\n", objs.size(), ss.size());
+    // 把网格质心挪到原点：动态放大时图标始终围绕“地图坐标点”长，不会越放越偏
+    float cxm = (minx+maxx)*0.5f, cym = (miny+maxy)*0.5f;
+    for (auto& v : m.verts) {
+        if (v.index < 0 || (size_t)v.index >= m.positions.size()) continue;
+        auto& p = m.positions[(size_t)v.index];
+        verts.push_back((p.x-cxm)*scale); verts.push_back((p.z-cym)*scale); verts.push_back(z);
+        verts.push_back(1.f); verts.push_back(1.f); verts.push_back(1.f);
+        verts.push_back(0.f); verts.push_back(0.f); verts.push_back(1.f);
+        verts.push_back(v.uv.u); verts.push_back(v.uv.v);
+    }
+    idx.assign(m.indices.begin(), m.indices.end()); // 顶点顺序一致，直接沿用网格索引
+    MapObj o;
+    makeBuffer(A, verts.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, o.vb, o.vm);
+    upload(A, o.vb, o.vm, verts.data(), verts.size()*4);
+    o.idxCount = (uint32_t)idx.size();
+    makeBuffer(A, o.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, o.ib, o.im);
+    upload(A, o.ib, o.im, idx.data(), o.idxCount*4);
+    o.descSet = desc;
+    o.pc.resize(16, 0.f);
+    float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1};
+    o.model.assign(M, M+16);
+    o.iconBaseScale = scale;
+    o.iconDim = std::max(maxx-minx, maxy-miny);
+    o.isIcon = true;
+    size_t idxOut = objs.size();
+    objs.push_back(std::move(o));
+    return idxOut;
+}
+// 图标动态缩放：保证屏幕上至少 minPix 像素（远了放大），近处维持作者原始尺寸
+static void setIconModel(MapObj& o, float x, float y, float z,
+                         float dist, float viewH, float minPix) {
+    float base = o.iconBaseScale * o.iconDim;
+    float need = minPix * 2.f * dist * tanf(0.45f) / std::max(1.f, viewH);
+    float s = (base > 1e-6f) ? std::max(1.f, need / base) : 1.f;
+    o.model[0] = s; o.model[5] = s; o.model[10] = 1.f; // 只放大水平，不抬高度（否则远视图像“升天”消失）
+    o.model[12] = x; o.model[13] = y; o.model[14] = z;
 }
 
 static void updateMapMVP(std::vector<MapObj>& objs, const float eye[3], const float target[3], float aspect) {
@@ -707,13 +784,123 @@ static int rayPlaneHit(float ex,float ey,float ez, float tx,float ty,float tz,
     hx = ex + dx*t; hy = ey + dy*t;
     return 1;
 }
-static void setMarkerModel(MapObj& mk, float x, float y) {
-    float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,20.f,1};
+static void setMarkerModel(MapObj& mk, float x, float y, float z = 20.f) {
+    float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1};
     mk.model.assign(M, M+16);
 }
+
+// ---------- 玩家队伍与 AI 野队（v0.5 地图队伍系统） ----------
+struct MapParty {
+    std::string name;
+    int icon = -1;
+    float x = 0, y = 0;
+    float speed = 3.f;
+    float homeX = 0, homeY = 0;
+    float wait = 0.f;
+    size_t objIdx = 0;
+    size_t badgeIdx = (size_t)-1; // 红色可见性徽标
+    std::vector<std::array<float,2>> way;
+    size_t wayIdx = 0;
+    bool isPlayer = false;
+    bool hold = false;   // 遭遇中停在原地
+};
+
 static std::vector<std::array<float,2>> g_way;
 static size_t g_wayIdx = 0;
 static float g_mx = 0.f, g_my = 0.f;
+static int g_pendingSettlement = -1;
+static size_t g_playerObjIdx = (size_t)-1; // 调试：VK_MAP_PLAYER_ONLY
+static std::string g_encounter;
+static std::string g_encounterPrev;
+static float g_hour = 6.f;      // 游戏时间：第 g_day 天 g_hour 时
+static int g_day = 1;
+
+// 精确包含测试：点在哪个地图面内（可走性另判）
+static int faceAt(const MapData& md, float x, float y) {
+    for (size_t i = 0; i < md.tris.size(); i++) {
+        const auto& t = md.tris[i];
+        float ax = md.pos[t[0]][0], ay = md.pos[t[0]][1];
+        float bx = md.pos[t[1]][0], by = md.pos[t[1]][1];
+        float cx = md.pos[t[2]][0], cy = md.pos[t[2]][1];
+        auto side = [](float px,float py,float qx,float qy,float rx,float ry) {
+            return (qx-px)*(ry-py) - (qy-py)*(rx-px);
+        };
+        float s0 = side(ax,ay,bx,by,x,y);
+        float s1 = side(bx,by,cx,cy,x,y);
+        float s2 = side(cx,cy,ax,ay,x,y);
+        bool neg = (s0 < 0) || (s1 < 0) || (s2 < 0);
+        bool pos = (s0 > 0) || (s1 > 0) || (s2 > 0);
+        if (!(neg && pos)) return (int)i;
+    }
+    return -1;
+}
+static bool posWalkable(const MapData& md, float x, float y) {
+    int f = faceAt(md, x, y);
+    return f >= 0 && mapWalkable(md.faceTerrain[(size_t)f]);
+}
+static int currentFace(const MapData& md, float x, float y) {
+    int f = faceAt(md, x, y);
+    return f >= 0 ? f : nearestWalkableFace(md, x, y);
+}
+// 带滑动：整步可走 → 走；否则分别试 x / y 轴（贴河岸不卡死）
+static void movePartySlide(const MapData& md, float& x, float& y, float dx, float dy) {
+    if (dx == 0.f && dy == 0.f) return;
+    float nx = x + dx, ny = y + dy;
+    if (posWalkable(md, nx, ny)) { x = nx; y = ny; return; }
+    bool moved = false;
+    if (dx != 0.f && posWalkable(md, nx, y)) { x = nx; moved = true; }
+    if (dy != 0.f && posWalkable(md, x, ny)) { y = ny; moved = true; }
+    (void)moved;
+}
+static void makeWaypoints(const MapData& md, int fromFace, int toFace,
+                          float endX, float endY,
+                          std::vector<std::array<float,2>>& way) {
+    way.clear();
+    auto path = mapBfsPath(md, fromFace, toFace);
+    if (path.empty()) return;
+    way.push_back({0,0}); // 占位，起点由调用方填
+    for (size_t i = 1; i < path.size(); i++) {
+        if (i + 1 < path.size()) {
+            float wx, wy; mapFaceCenter(md, path[i], wx, wy);
+            way.push_back({wx, wy});
+        } else {
+            way.push_back({endX, endY});
+        }
+    }
+}
+// 沿 g_way 推进玩家队伍；返回是否还有路在走
+static bool stepPlayerWay(const MapData& md, float step) {
+    while (g_wayIdx < g_way.size()) {
+        float dx = g_way[g_wayIdx][0] - g_mx, dy = g_way[g_wayIdx][1] - g_my;
+        float dl = sqrtf(dx*dx + dy*dy);
+        if (dl <= step) {
+            g_mx = g_way[g_wayIdx][0]; g_my = g_way[g_wayIdx][1];
+            g_wayIdx++;
+            continue;
+        }
+        g_mx += dx/dl*step; g_my += dy/dl*step;
+        return true;
+    }
+    return false;
+}
+static void stepAiParty(MapParty& p, float step) {
+    if (p.wayIdx >= p.way.size()) return;
+    float dx = p.way[p.wayIdx][0] - p.x, dy = p.way[p.wayIdx][1] - p.y;
+    float dl = sqrtf(dx*dx + dy*dy);
+    if (dl <= step) { p.x = p.way[p.wayIdx][0]; p.y = p.way[p.wayIdx][1]; p.wayIdx++; return; }
+    p.x += dx/dl*step; p.y += dy/dl*step;
+}
+static void chooseAiPath(const MapData& md, MapParty& p, float range) {
+    float tx = p.homeX + ((rand()%2000)/1000.f - 1.f)*range;
+    float ty = p.homeY + ((rand()%2000)/1000.f - 1.f)*range;
+    int ff = currentFace(md, p.x, p.y);
+    int tf = nearestWalkableFace(md, tx, ty);
+    if (ff < 0 || tf < 0) { p.wait = 3.f; return; }
+    float ex, ey; mapFaceCenter(md, tf, ex, ey);
+    makeWaypoints(md, ff, tf, ex, ey, p.way);
+    if (p.way.size() >= 2) { p.way[0] = {p.x, p.y}; p.wayIdx = 1; p.wait = 0.f; }
+    else p.wait = 3.f;
+}
 
 static void makeMarkerObj(App& A, MapObj& mk, const std::vector<std::string>& texNames) {
     float v[] = {
@@ -727,9 +914,50 @@ static void makeMarkerObj(App& A, MapObj& mk, const std::vector<std::string>& te
     mk.idxCount = 3;
     makeBuffer(A, sizeof(idx), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, mk.ib, mk.im);
     upload(A, mk.ib, mk.im, idx, sizeof(idx));
-    auto ti = A.texIndex.find("map_misc");
+    auto ti = A.texIndex.find("white");
     mk.descSet = A.texSets[ti != A.texIndex.end() ? ti->second : 0];
     mk.pc.resize(16, 0.f);
+    mk.iconBaseScale = 1.f; mk.iconDim = 1.4f; // 让目的地黄标也随缩放保底可见
+    mk.isIcon = true;
+}
+
+// 队伍可见性徽标：圆形/菱形色块，动态保底屏占，和目的地标记同管线（保证任何缩放都看得见）
+static size_t makeBadgeObj(App& A, VkDescriptorSet desc, float r, float g, float b,
+                           float radius, float x, float y, float z, std::vector<MapObj>& objs) {
+    const int seg = 16;
+    std::vector<float> verts;
+    verts.reserve((size_t)(seg+2)*11);
+    auto push = [&](float px, float py) {
+        verts.push_back(px); verts.push_back(py); verts.push_back(0.f);
+        verts.push_back(r); verts.push_back(g); verts.push_back(b);
+        verts.push_back(0.f); verts.push_back(0.f); verts.push_back(1.f);
+        verts.push_back(0.5f); verts.push_back(0.5f);
+    };
+    push(0.f, 0.f);
+    for (int i = 0; i <= seg; i++) {
+        float a = (float)i / (float)seg * 6.2831853f;
+        push(cosf(a)*radius, sinf(a)*radius);
+    }
+    std::vector<uint32_t> idx;
+    for (int i = 0; i < seg; i++) {
+        idx.push_back(0); idx.push_back((uint32_t)i+1); idx.push_back((uint32_t)i+2);
+    }
+    MapObj o;
+    makeBuffer(A, verts.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, o.vb, o.vm);
+    upload(A, o.vb, o.vm, verts.data(), verts.size()*4);
+    o.idxCount = (uint32_t)idx.size();
+    makeBuffer(A, o.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, o.ib, o.im);
+    upload(A, o.ib, o.im, idx.data(), o.idxCount*4);
+    o.descSet = desc;
+    o.pc.resize(16, 0.f);
+    float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1};
+    o.model.assign(M, M+16);
+    o.iconBaseScale = 1.f;
+    o.iconDim = radius*2.f;
+    o.isIcon = true;
+    size_t out = objs.size();
+    objs.push_back(std::move(o));
+    return out;
 }
 
 static void recordMapCmd(App& A, const std::vector<MapObj>& objs, size_t img) {
@@ -746,7 +974,12 @@ static void recordMapCmd(App& A, const std::vector<MapObj>& objs, size_t img) {
     rp.clearValueCount=2; rp.pClearValues=cv;
     vkCmdBeginRenderPass(A.cmds[img], &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipe);
-    for (auto& o : objs) {
+    bool iconsOnly = getenv("VK_MAP_ICONS_ONLY") != nullptr;
+    bool playerOnly = getenv("VK_MAP_PLAYER_ONLY") != nullptr;
+    for (size_t oi = 0; oi < objs.size(); oi++) {
+        auto& o = objs[oi];
+        if (iconsOnly && !o.isIcon) continue;
+        if (playerOnly && oi != g_playerObjIdx) continue;
         vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
         vkCmdPushConstants(A.cmds[img], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, o.pc.data());
         VkDeviceSize off=0;
@@ -786,9 +1019,10 @@ int main(int argc, char** argv) {
     A.hInst = GetModuleHandleA(nullptr);
     WNDCLASSA wc{}; wc.lpfnWndProc=wndProc; wc.hInstance=A.hInst; wc.lpszClassName="vkMapWnd";
     RegisterClassA(&wc);
-    A.hwnd = CreateWindowExA(0, "vkMapWnd", "CV War 大地图自研渲染 | WASD 平移 QE 缩放 方向键旋转 ESC 退出",
+    A.hwnd = CreateWindowExA(0, "vkMapWnd", "CV War Campaign Map (loading)",
         WS_OVERLAPPEDWINDOW|WS_VISIBLE, 120, 60, 1280, 720, nullptr, nullptr, A.hInst, nullptr);
     if (!A.hwnd) { std::printf("FAIL 建窗\n"); return 1; }
+    setTitleUtf8(A.hwnd, "CV War 大地图 | WASD行军 点击寻路/进城 空格暂停 QE缩放 方向键视角 ESC退出");
     initVk(A);
 
     MapData md;
@@ -797,11 +1031,16 @@ int main(int argc, char** argv) {
     std::filesystem::path mapPath(argv[1]);
     std::string moduleDir = mapPath.parent_path().string();          // Modules\CV War
     std::string gameRoot = mapPath.parent_path().parent_path().parent_path().string(); // 游戏根
-    auto settlements = loadSettlements(moduleDir);
-    std::fprintf(stderr, "定居点 %zu 个（module=%s）\n", settlements.size(), moduleDir.c_str());
+    auto icons = loadMapIcons(moduleDir);
+    auto templates = loadPartyTemplates(moduleDir);
+    auto partyRecs = loadParties(moduleDir);
+    auto settlements = loadSettlements(partyRecs);
+    std::fprintf(stderr, "map_icons %zu 个 / parties %zu 条 / 定居点 %zu 个（module=%s）\n",
+                 icons.size(), partyRecs.size(), settlements.size(), moduleDir.c_str());
     std::set<std::string> texNames;
     for (size_t t=0;t<md.meshes.size();t++) if (!md.meshes[t].verts.empty()) texNames.insert(mapTexture((int)t).first);
-    texNames.insert("fake_houses"); // 定居点图标贴图（根 Textures）
+    texNames.insert("fake_houses"); // 地图图标贴图（根 Textures）
+    texNames.insert("white");       // 程序化纯白贴图：徽标/标记的顶点色直出
     std::vector<std::string> names(texNames.begin(), texNames.end());
     std::fprintf(stderr, "地图 %zu 顶点 范围 x[%.0f..%.0f] y[%.0f..%.0f]\n",
         md.pos.size(), md.minX, md.maxX, md.minY, md.maxY);
@@ -809,14 +1048,88 @@ int main(int argc, char** argv) {
     initMapPipeline(A);
     std::vector<MapObj> mapObjs;
     buildMapObjs(A, md, mapObjs);
-    buildSettlementIcons(A, settlements, moduleDir, mapObjs);
+
+    std::map<std::string, brf::Mesh> iconMeshes;
+    loadIconMeshes(moduleDir, iconMeshes);
+    auto ti = A.texIndex.find("fake_houses");
+    VkDescriptorSet iconDesc = A.texSets[ti != A.texIndex.end() ? ti->second : 0];
+    auto tw = A.texIndex.find("white");
+    VkDescriptorSet whiteDesc = A.texSets[tw != A.texIndex.end() ? tw->second : 0];
+
+    // 定居点图标：作者在 parties.txt 里指定的 icon（flags 低 8 位）
+    size_t builtIcons = 0;
+    for (auto& s : settlements) {
+        if ((size_t)s.icon >= icons.size()) { std::fprintf(stderr, "定居点 %s 图标越界 %d\n", s.id.c_str(), s.icon); continue; }
+        s.iconIdx = makeIconObj(A, iconMeshes, iconDesc, icons[(size_t)s.icon].mesh, icons[(size_t)s.icon].scale,
+                                s.x, s.y, 2.f, mapObjs);
+        if (s.iconIdx != (size_t)-1) builtIcons++;
+    }
+    std::fprintf(stderr, "定居点图标 %zu/%zu 个已上屏\n", builtIcons, settlements.size());
+
+    // 玩家队伍：p_main_party（坐标 tokens 18/19；图标 = flags & 0xff）
+    // 从场景按 M 回来时，vk_map 的 argv[3]/argv[4] 带出城时的队伍坐标
+    g_mx = (md.minX+md.maxX)/2; g_my = (md.minY+md.maxY)/2;
+    int playerIcon = 0;
+    for (auto& p : partyRecs) if (p.id == "p_main_party") {
+        g_mx = p.x; g_my = p.y; playerIcon = p.icon; break;
+    }
+    if (argc >= 5) { g_mx = (float)atof(argv[3]); g_my = (float)atof(argv[4]); }
+    if (!posWalkable(md, g_mx, g_my)) {
+        int f = nearestWalkableFace(md, g_mx, g_my);
+        mapFaceCenter(md, f, g_mx, g_my);
+    }
+    size_t playerIdx = (size_t)-1;
+    if ((size_t)playerIcon < icons.size())
+        playerIdx = makeIconObj(A, iconMeshes, iconDesc, icons[(size_t)playerIcon].mesh,
+                                icons[(size_t)playerIcon].scale, g_mx, g_my, 3.f, mapObjs);
+    g_playerObjIdx = playerIdx;
+    // 玩家青色徽标：无论缩放到哪里都一眼看见（作者图标保留在徽标下方）
+    size_t playerBadgeIdx = makeBadgeObj(A, whiteDesc, 0.1f, 0.95f, 1.f, 3.f, g_mx, g_my, 20.f, mapObjs);
+    std::fprintf(stderr, "玩家队伍起点 (%.1f,%.1f) icon=%d objIdx=%zu tri=%u\n",
+                 g_mx, g_my, playerIcon, playerIdx,
+                 playerIdx != (size_t)-1 ? mapObjs[playerIdx].idxCount : 0);
+
+    // AI 野队：作者放的 bandit spawn point 当出生点，party template 决定名字和图标
+    std::map<std::string, TemplateDef> tplById;
+    for (auto& t : templates) tplById[t.id] = t;
+    struct SpawnMap { const char* pid; const char* tpl; };
+    const SpawnMap spawns[] = {
+        {"p_looter_spawn_point",         "pt_looters"},
+        {"p_steppe_bandit_spawn_point",  "pt_steppe_bandits"},
+        {"p_forest_bandit_spawn_point",  "pt_forest_bandits"},
+        {"p_mountain_bandit_spawn_point","pt_mountain_bandits"},
+        {"p_sea_raider_spawn_point_1",   "pt_sea_raiders"},
+        {"p_desert_bandit_spawn_point",  "pt_desert_bandits"},
+    };
+    std::vector<MapParty> ai;
+    for (auto& sm : spawns) {
+        for (auto& p : partyRecs) if (p.id == sm.pid) {
+            auto tIt = tplById.find(sm.tpl);
+            if (tIt == tplById.end()) continue;
+            MapParty ap;
+            ap.name = tIt->second.name; ap.icon = tIt->second.icon;
+            ap.x = p.x; ap.y = p.y; ap.homeX = p.x; ap.homeY = p.y;
+            ap.speed = 1.8f;
+            if (!posWalkable(md, ap.x, ap.y)) {
+                int f = nearestWalkableFace(md, ap.x, ap.y);
+                mapFaceCenter(md, f, ap.x, ap.y);
+                ap.homeX = ap.x; ap.homeY = ap.y;
+            }
+            if ((size_t)ap.icon < icons.size())
+                ap.objIdx = makeIconObj(A, iconMeshes, iconDesc, icons[(size_t)ap.icon].mesh,
+                                        icons[(size_t)ap.icon].scale, ap.x, ap.y, 3.f, mapObjs);
+            else ap.objIdx = (size_t)-1;
+            ap.badgeIdx = makeBadgeObj(A, whiteDesc, 1.f, 0.12f, 0.12f, 2.2f, ap.x, ap.y, 15.f, mapObjs);
+            ai.push_back(std::move(ap));
+        }
+    }
+    std::fprintf(stderr, "AI 野队 %zu 支（bandit spawn point + party template 图标）\n", ai.size());
+
+    // 黄色标记 = 点击目的地（无路径时藏到地下）
     size_t markerIdx = mapObjs.size();
     mapObjs.emplace_back();
     makeMarkerObj(A, mapObjs[markerIdx], names);
-    int startFace = nearestWalkableFace(md, (md.minX+md.maxX)/2, (md.minY+md.maxY)/2);
-    mapFaceCenter(md, startFace, g_mx, g_my);
-    setMarkerModel(mapObjs[markerIdx], g_mx, g_my);
-    std::fprintf(stderr, "起点面=%d 标记(%.0f,%.0f)\n", startFace, g_mx, g_my);
+    setMarkerModel(mapObjs[markerIdx], g_mx, g_my, -999.f);
     allocMapCmds(A);
 
     VK_DEV_FN(A.dev, vkAcquireNextImageKHR); VK_DEV_FN(A.dev, vkQueueSubmit); VK_DEV_FN(A.dev, vkQueuePresentKHR);
@@ -830,36 +1143,81 @@ int main(int argc, char** argv) {
         vkCreateFence(A.dev, &af, nullptr, &A.acqFences[i]);
     }
 
-    float cx=(md.minX+md.maxX)/2, cy=(md.minY+md.maxY)/2;
-    float yaw=0.f, dist=520.f, height=420.f;
+    float cx=g_mx, cy=g_my;
+    float yaw=0.f, dist=150.f, height=130.f; // 默认贴近队伍，远处图标会自动放大保底
     auto k = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    auto enterSettlement = [&](size_t idx) {
+        if (idx >= settlements.size()) return;
+        auto& s = settlements[idx];
+        std::string sco = moduleDir + "\\SceneObj\\" + s.scene + ".sco";
+        if (!std::filesystem::exists(sco)) {
+            std::fprintf(stderr, "%s 场景缺 %s，不进城\n", s.id.c_str(), s.scene.c_str());
+            return;
+        }
+        std::string argline =
+            "\"" + sco + "\" \"" + moduleDir + "\\scene_props.txt\" \"" +
+            gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
+            std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
+            gameRoot + "\\Textures\"";
+        char posbuf[64];
+        std::snprintf(posbuf, sizeof(posbuf), " %.2f %.2f", g_mx, g_my);
+        argline += posbuf;
+        std::fprintf(stderr, "进入 %s (%s，CV War 作者布局)\n", s.name.c_str(), s.scene.c_str());
+        launchAndExit("vk_scene.exe", argline);
+    };
     MSG msg;
     uint32_t frame=0;
-    ULONGLONG last=GetTickCount64();
+    LARGE_INTEGER qf, lastQ;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&lastQ);
+    int lastHour=-1, lastDay=-1; bool lastPaused=false; std::string lastEnc;
     while (true) {
         while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message==WM_QUIT) return 0;
             TranslateMessage(&msg); DispatchMessageA(&msg);
         }
-        ULONGLONG now=GetTickCount64();
-        float dt=std::min(0.1f,(float)(now-last)/1000.f); last=now;
-        float pan = dist*0.35f*dt;
-        float fwx=sinf(yaw), fwy=cosf(yaw);
-        float rx=cosf(yaw), ry=-sinf(yaw);
-        if (k('W')) { cx-=fwx*pan; cy-=fwy*pan; }
-        if (k('S')) { cx+=fwx*pan; cy+=fwy*pan; }
-        if (k('D')) { cx+=rx*pan; cy+=ry*pan; }
-        if (k('A')) { cx-=rx*pan; cy-=ry*pan; }
-        if (k('E')) dist=std::max(120.f, dist-180.f*dt);
-        if (k('Q')) dist=std::min(1500.f, dist+180.f*dt);
+        LARGE_INTEGER nowQ;
+        QueryPerformanceCounter(&nowQ);
+        float dt=std::min(0.1f,(float)((double)(nowQ.QuadPart-lastQ.QuadPart)/(double)qf.QuadPart));
+        lastQ=nowQ;
+        float simDt = g_paused ? 0.f : dt;
+
+        // 游戏时间：1 秒 = 1 小时
+        if (simDt > 0.f) { g_hour += simDt; while (g_hour >= 24.f) { g_hour -= 24.f; g_day++; } }
+
+        // 相机围绕玩家队伍，QE 缩放 / 方向键视角
+        // 缩放时高度跟着比例走（俯角不变），拉到最远时地图仍铺满屏幕而不是压成一条线
+        if (k('E')) { dist=std::max(120.f, dist-180.f*dt); height=std::max(60.f, dist*0.866f); }
+        if (k('Q')) { dist=std::min(520.f, dist+180.f*dt); height=std::max(60.f, dist*0.866f); }
         if (k(VK_LEFT))  yaw+=0.8f*dt;
         if (k(VK_RIGHT)) yaw-=0.8f*dt;
         if (k(VK_UP))   height=std::min(1800.f, height+240.f*dt);
         if (k(VK_DOWN)) height=std::max(120.f, height-240.f*dt);
+        cx += (g_mx-cx)*std::min(1.f, dt*4.f);
+        cy += (g_my-cy)*std::min(1.f, dt*4.f);
+
+        float fwx=sinf(yaw), fwy=cosf(yaw);
+        float rx=cosf(yaw), ry=-sinf(yaw);
+
+        // WASD = 玩家队伍实时行军（相对屏幕：W 朝屏幕上方，Shift 加速）
+        float mdx=0.f, mdy=0.f;
+        if (k('W')) { mdx -= fwx; mdy -= fwy; }
+        if (k('S')) { mdx += fwx; mdy += fwy; }
+        if (k('D')) { mdx += rx; mdy += ry; }
+        if (k('A')) { mdx -= rx; mdy -= ry; }
+        if ((mdx != 0.f || mdy != 0.f) && simDt > 0.f) {
+            float len = sqrtf(mdx*mdx + mdy*mdy);
+            float speed = k(VK_SHIFT) ? 12.f : 4.5f;
+            movePartySlide(md, g_mx, g_my, mdx/len*speed*simDt, mdy/len*speed*simDt);
+            g_way.clear(); g_wayIdx = 0; g_pendingSettlement = -1;
+            setMarkerModel(mapObjs[markerIdx], g_mx, g_my, -999.f);
+        }
+
         float eye[3]={cx+sinf(yaw)*dist, cy+cosf(yaw)*dist, height};
         float tgt[3]={cx, cy, 0.f};
         float aspect=(float)A.extent.width/std::max(1u,(uint32_t)A.extent.height);
-        // 点击：射线打 z=0 地图平面 → 最近可走面 → BFS → 逐面中心行进
+
+        // 点击：射线打 z=0 地图平面 → 点定居点=进城/行军进城，点空地=寻路
         if (g_click.x >= 0) {
             float hx=0, hy=0;
             int hit = rayPlaneHit(eye[0], eye[1], eye[2], tgt[0], tgt[1], tgt[2],
@@ -867,62 +1225,117 @@ int main(int argc, char** argv) {
                                   (float)A.extent.width, (float)A.extent.height, hx, hy);
             g_click.x = -1; g_click.y = -1;
             if (hit) {
-                // 先看是否点到定居点图标 → 拉起对应场景（地图↔场景闭环）
-                bool entered = false;
-                for (auto& s : settlements) {
-                    float dx = hx - s.x, dy = hy - s.y;
-                    if (dx*dx + dy*dy > 9.f) continue;
-                    // 场景一律用 CV War 作者自己的布局（女王 2026-11-12 定：原版套用会冲突）
-                    std::string sco = moduleDir + "\\SceneObj\\" + s.scene + ".sco";
-                    if (!std::filesystem::exists(sco)) {
-                        std::fprintf(stderr, "%s 场景缺 %s，当普通移动\n", s.id.c_str(), s.scene.c_str());
-                        continue;
-                    }
-                    std::string argline =
-                        "\"" + sco + "\" \"" + moduleDir + "\\scene_props.txt\" \"" +
-                        gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
-                        std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
-                        gameRoot + "\\Textures\"";
-                    std::fprintf(stderr, "进入 %s (%s，CV War 布局)\n", s.name.c_str(), s.scene.c_str());
-                    launchAndExit("vk_scene.exe", argline);
-                    entered = true;
-                    break;
-                }
-                if (entered) continue;
-                int ff = nearestWalkableFace(md, g_mx, g_my);
-                int tf = nearestWalkableFace(md, hx, hy);
-                auto path = mapBfsPath(md, ff, tf);
-                if (path.empty()) {
-                    std::fprintf(stderr, "点击(%.0f,%.0f) 无路（起点面%d 目标面%d）\n", hx, hy, ff, tf);
-                } else {
-                    g_way.clear();
-                    g_way.push_back({g_mx, g_my});
-                    for (size_t i = 1; i < path.size(); i++) {
-                        if (i + 1 < path.size()) {
-                            float wx, wy; mapFaceCenter(md, path[i], wx, wy);
-                            g_way.push_back({wx, wy});
+                bool handled = false;
+                for (size_t si=0; si<settlements.size(); si++) {
+                    auto& s = settlements[si];
+                    float ddx = hx - s.x, ddy = hy - s.y;
+                    if (ddx*ddx + ddy*ddy > 9.f) continue;
+                    float pdx = g_mx - s.x, pdy = g_my - s.y;
+                    int ff = currentFace(md, g_mx, g_my);
+                    int tf = nearestWalkableFace(md, s.x, s.y);
+                    if (pdx*pdx + pdy*pdy <= 9.f || ff < 0 || tf < 0) {
+                        enterSettlement(si); // 已在城下：直接进城
+                    } else {
+                        makeWaypoints(md, ff, tf, s.x, s.y, g_way);
+                        if (g_way.size() >= 2) {
+                            g_way[0] = {g_mx, g_my}; g_wayIdx = 1; g_pendingSettlement = (int)si;
+                            setIconModel(mapObjs[markerIdx], s.x, s.y, 20.f, dist, (float)A.extent.height, 14.f);
+                            std::fprintf(stderr, "向 %s 行军，到达自动进城\n", s.name.c_str());
                         } else {
-                            g_way.push_back({hx, hy}); // 终点精确到点击位置
+                            std::fprintf(stderr, "%s 无路可通，直接进城（保持旧行为）\n", s.name.c_str());
+                            enterSettlement(si);
                         }
                     }
-                    g_wayIdx = 1;
-                    std::fprintf(stderr, "点击(%.0f,%.0f) 路径=%zu 面 -> %zu 段\n", hx, hy, path.size(), g_way.size());
+                    handled = true;
+                    break;
+                }
+                if (!handled) {
+                    int ff = currentFace(md, g_mx, g_my);
+                    int tf = nearestWalkableFace(md, hx, hy);
+                    makeWaypoints(md, ff, tf, hx, hy, g_way);
+                    if (g_way.size() >= 2) {
+                        g_way[0] = {g_mx, g_my}; g_wayIdx = 1; g_pendingSettlement = -1;
+                        setIconModel(mapObjs[markerIdx], hx, hy, 20.f, dist, (float)A.extent.height, 14.f);
+                        std::fprintf(stderr, "点击(%.0f,%.0f) 路径 %zu 段\n", hx, hy, g_way.size()-1);
+                    } else {
+                        std::fprintf(stderr, "点击(%.0f,%.0f) 无路（起点面%d 目标面%d）\n", hx, hy, ff, tf);
+                    }
                 }
             }
         }
-        if (g_wayIdx < g_way.size()) {
-            float dx = g_way[g_wayIdx][0] - g_mx, dy = g_way[g_wayIdx][1] - g_my;
-            float dl = sqrtf(dx*dx + dy*dy);
-            float step = 130.f * dt;
-            if (dl <= step) {
-                g_mx = g_way[g_wayIdx][0]; g_my = g_way[g_wayIdx][1];
-                g_wayIdx++;
-            } else {
-                g_mx += dx/dl*step; g_my += dy/dl*step;
+
+        // 玩家沿点击路径前进
+        if (simDt > 0.f && g_wayIdx < g_way.size()) {
+            float speed = k(VK_SHIFT) ? 12.f : 4.5f;
+            bool moving = stepPlayerWay(md, speed*simDt);
+            if (!moving) {
+                if (g_pendingSettlement >= 0) {
+                    auto& s = settlements[(size_t)g_pendingSettlement];
+                    float pdx = g_mx - s.x, pdy = g_my - s.y;
+                    if (pdx*pdx + pdy*pdy <= 9.f) enterSettlement((size_t)g_pendingSettlement);
+                }
+                g_pendingSettlement = -1;
+                setMarkerModel(mapObjs[markerIdx], g_mx, g_my, -999.f);
             }
-            setMarkerModel(mapObjs[markerIdx], g_mx, g_my);
         }
+
+        // AI 野队巡逻：围绕出生点随机选可走面，BFS 行走
+        if (simDt > 0.f) for (auto& ap : ai) {
+            if (ap.hold) continue;
+            if (ap.wayIdx < ap.way.size()) stepAiParty(ap, ap.speed*simDt);
+            else { ap.wait -= simDt; if (ap.wait <= 0.f) chooseAiPath(md, ap, 30.f); }
+            if (ap.objIdx != (size_t)-1) setIconModel(mapObjs[ap.objIdx], ap.x, ap.y, 3.f,
+                                                      dist, (float)A.extent.height, 16.f);
+            if (ap.badgeIdx != (size_t)-1) setIconModel(mapObjs[ap.badgeIdx], ap.x, ap.y, 15.f,
+                                                        dist, (float)A.extent.height, 14.f);
+        }
+
+        // 遭遇：玩家撞上野队 → 双方停下，标题显示（战斗下一版接）
+        if (simDt > 0.f) {
+        g_encounter.clear();
+        for (auto& ap : ai) {
+            float dx = ap.x - g_mx, dy = ap.y - g_my;
+            float d2 = dx*dx + dy*dy;
+            if (d2 < 1.44f) {
+                g_encounter = ap.name;
+                ap.hold = true;
+                g_way.clear(); g_wayIdx = 0; g_pendingSettlement = -1;
+                setMarkerModel(mapObjs[markerIdx], g_mx, g_my, -999.f);
+            } else if (ap.hold && d2 > 4.84f) {
+                ap.hold = false; ap.wait = 1.5f;
+            }
+        }
+        }
+
+        if (g_encounter != g_encounterPrev) {
+            if (!g_encounter.empty()) std::fprintf(stderr, "[遭遇] %s！\n", g_encounter.c_str());
+            else std::fprintf(stderr, "[离开] %s\n", g_encounterPrev.c_str());
+            g_encounterPrev = g_encounter;
+        }
+
+        // 玩家图标跟手（比野队/定居点稍大，永远看得见）
+        if (playerIdx != (size_t)-1) setIconModel(mapObjs[playerIdx], g_mx, g_my, 3.f,
+                                                  dist, (float)A.extent.height, 22.f);
+        if (playerBadgeIdx != (size_t)-1) setIconModel(mapObjs[playerBadgeIdx], g_mx, g_my, 20.f,
+                                                       dist, (float)A.extent.height, 18.f);
+        for (auto& s : settlements)
+            if (s.iconIdx != (size_t)-1) setIconModel(mapObjs[s.iconIdx], s.x, s.y, 2.f,
+                                                      dist, (float)A.extent.height, 12.f);
+
         updateMapMVP(mapObjs, eye, tgt, aspect);
+
+        // 标题栏 HUD（时间/坐标/暂停/遭遇）
+        int hour = (int)g_hour;
+        if (hour != lastHour || g_day != lastDay || g_paused != lastPaused || g_encounter != lastEnc) {
+            std::string enc = g_encounter.empty() ? "" : " | 遭遇:" + g_encounter;
+            char title[320];
+            std::snprintf(title, sizeof(title),
+                "CV War 大地图 | 第%d天 %02d:00 | 队伍(%.0f,%.0f)%s%s | WASD行军 Shift加速 点击寻路/进城 空格暂停 QE缩放 方向键视角 ESC退出",
+                g_day, hour, g_mx, g_my,
+                g_paused ? " | 已暂停" : "", enc.c_str());
+            setTitleUtf8(A.hwnd, title);
+            lastHour = hour; lastDay = g_day; lastPaused = g_paused; lastEnc = g_encounter;
+        }
 
         size_t fi=frame%A.images.size();
         uint32_t img=0;
