@@ -347,7 +347,7 @@ inline BrfFile parse(const std::string& path, bool verbose = false) {
     if (!f) throw std::runtime_error("打不开文件: " + path);
     Reader r(f);
     BrfFile b;
-    int vertFormat = 2; // 默认 warband v2；文件整体 version==1 时为 OpenBRF 文件格式
+    int vertFormat = 0; // 默认 M&B 原生 v0（双 uv）；有 rfver 时按文件版本 + mesh flags 定 1/2
     while (true) {
         std::string token = r.str();
         if (verbose) std::printf("token: %s\n", token.c_str());
@@ -389,7 +389,8 @@ inline BrfFile parse(const std::string& path, bool verbose = false) {
             for (auto& m : b.meshes) {
                 m.name = r.str(); m.flags = r.u32(); m.material = r.str();
                 if (verbose) std::printf("  mesh[%s] flags=%08X mat=%s\n", m.name.c_str(), m.flags, m.material.c_str());
-                vertFormat = (m.flags & (1u << 16)) ? 1 : 2; // warband 顶点版本
+                if (b.version != 0) vertFormat = (m.flags & (1u << 16)) ? 1 : 2; // 有 rfver：按 flags 选 warband v1/v2
+                else vertFormat = 0;                                            // 无 rfver：M&B 原生 v0（双 uv）
                 loadVector(r, m.positions, [](Reader& rr, Vec3& p) { p = rr.point3(); });
                 // rigging: vector<{i32 bone, vector<{i32 vidx, f32 weight}>}>
                 uint32_t nRig = r.u32();
@@ -412,8 +413,15 @@ inline BrfFile parse(const std::string& path, bool verbose = false) {
                 loadVector(r, m.verts, [&](Reader& rr, Vertex& v) {
                     v.index = rr.i32(); v.color = rr.u32();
                     v.normal = rr.point3();
-                    if (vertFormat == 1) { v.tangent = rr.point3(); v.tangi = rr.u8(); v.hasTangent = true; }
-                    v.uv = uvFlipped(rr.point2());
+                    if (vertFormat == 0) {            // M&B 原生：两个 uv 点
+                        v.uv = uvFlipped(rr.point2());
+                        rr.point2();
+                    } else if (vertFormat == 1) {
+                        v.tangent = rr.point3(); v.tangi = rr.u8(); v.hasTangent = true;
+                        v.uv = uvFlipped(rr.point2());
+                    } else {
+                        v.uv = uvFlipped(rr.point2());
+                    }
                 });
                 uint32_t nFace = r.u32();
                 m.indices.resize((size_t)nFace * 3);

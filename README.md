@@ -34,7 +34,7 @@ original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
 
 ### World map / 大地图
 
-`vk_map` parses a module's `map.txt` (vertex + triangle mesh, each triangle tagged with a terrain code) and renders the campaign map, grouping triangles by terrain type and applying the matching ground texture. Camera: **WASD** pan, **QE** zoom, **arrow keys** rotate, **ESC** exit. **Click** anywhere on walkable land to move the yellow marker along a BFS path over shared triangle edges; water and river triangles are impassable.
+`vk_map` parses a module's `map.txt` (vertex + triangle mesh, each triangle tagged with a terrain code) and renders the campaign map, grouping triangles by terrain type and applying the matching ground texture. Settlement icons are placed from `map_icons.txt` + `parties.txt`; clicking one launches `vk_scene` for that settlement's scene (`M` returns to the map). Camera: **WASD** pan, **QE** zoom, **arrow keys** rotate, **ESC** exit. **Click** anywhere on walkable land to move the yellow marker along a BFS path over shared triangle edges; water and river triangles are impassable.
 
 ```
 vk_map "<module>\map.txt" "<game root>\Textures"
@@ -138,7 +138,7 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 
 ## 大地图 / World map
 
-`vk_map` 解析模组的 `map.txt`（顶点 + 三角形网格，每个三角形带地形码），按地形分组贴图渲染战役大地图。相机：**WASD** 平移，**QE** 缩放，**方向键** 旋转，**ESC** 退出。**点击**可走陆地上的任意位置，黄色标记沿三角形共享边做 BFS 寻路移动；水域与河流不可通行。
+`vk_map` 解析模组的 `map.txt`（顶点 + 三角形网格，每个三角形带地形码），按地形分组贴图渲染战役大地图。定居点图标按 `map_icons.txt` + `parties.txt` 摆放；点击定居点会启动 `vk_scene` 加载对应场景（按 `M` 返回大地图）。相机：**WASD** 平移，**QE** 缩放，**方向键** 旋转，**ESC** 退出。**点击**可走陆地上的任意位置，黄色标记沿三角形共享边做 BFS 寻路移动；水域与河流不可通行。
 
 ```
 vk_map "<模组目录>\map.txt" "<游戏根目录>\Textures"

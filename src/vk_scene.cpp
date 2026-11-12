@@ -24,6 +24,20 @@
 #include <string>
 #include <fstream>
 
+// 崩溃日志：写 vk_scene_crash.txt（异常码+地址+栈返回地址），便于下次定位“进去就崩”
+static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
+    FILE* f = fopen("vk_scene_crash.txt", "a");
+    if (f) {
+        std::fprintf(f, "exception code=0x%08lX addr=%p\n",
+                     (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+        void* stack[32];
+        USHORT n = CaptureStackBackTrace(0, 32, stack, nullptr);
+        for (USHORT i = 0; i < n; i++) std::fprintf(f, "  [%d] %p\n", (int)i, stack[i]);
+        std::fflush(f); fclose(f);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 // ---------- Vulkan 函数动态加载 ----------
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
@@ -192,7 +206,8 @@ static void submitOnce(App& A, const std::function<void(VkCommandBuffer)>& fn) {
     vkFreeCommandBuffers(A.dev, A.cmdPool, 1, &cb);
 }
 
-static void initTextures(App& A, const std::string& ddsDir, const std::vector<std::string>& names) {
+static void initTextures(App& A, const std::string& ddsDir, const std::vector<std::string>& names,
+                         const std::string& fallbackDdsDir = "") {
     VK_DEV_FN(A.dev, vkCreateImage); VK_DEV_FN(A.dev, vkAllocateMemory); VK_DEV_FN(A.dev, vkBindImageMemory);
     VK_DEV_FN(A.dev, vkGetImageMemoryRequirements); VK_DEV_FN(A.dev, vkCreateImageView);
     VK_DEV_FN(A.dev, vkCreateSampler); VK_DEV_FN(A.dev, vkCmdCopyBufferToImage); VK_DEV_FN(A.dev, vkCmdPipelineBarrier);
@@ -205,6 +220,8 @@ static void initTextures(App& A, const std::string& ddsDir, const std::vector<st
     CHECK(vkCreateSampler(A.dev, &sc, nullptr, &A.sampler), "sampler");
     for (auto& n : names) {
         std::string path = ddsDir + "\\" + n + ".dds";
+        if (!std::filesystem::exists(path) && !fallbackDdsDir.empty())
+            path = fallbackDdsDir + "\\" + n + ".dds";
         dds::Image img;
         try { img = dds::load(path); }
         catch (const std::exception& e) { std::fprintf(stderr, "贴图缺失 %s（%s），跳过\n", path.c_str(), e.what()); continue; }
@@ -860,41 +877,42 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
     for (auto& v : mesh.verts) {
         if (v.index < 0 || (size_t)v.index >= mesh.positions.size()) continue;
         auto& p = mesh.positions[v.index];
-        // SCO 3x3 row-major 矩阵（BRF 坐标空间）
-        float bx = prop.m[0]*p.x + prop.m[1]*p.y + prop.m[2]*p.z;
-        float by = prop.m[3]*p.x + prop.m[4]*p.y + prop.m[5]*p.z;
-        float bz = prop.m[6]*p.x + prop.m[7]*p.y + prop.m[8]*p.z;
+        // SCO 3x3 矩阵的约定：BRF 场景物件按“z 为摆放置向”参与旋转，即先 y/z 互换，
+        // 乘矩阵后再换回（等价 S·M·S）。直接按 (x,y,z) 乘会把房子绕错轴、翻个儿。
+        float bx = prop.m[0]*p.x + prop.m[1]*p.z + prop.m[2]*p.y;
+        float by = prop.m[6]*p.x + prop.m[7]*p.z + prop.m[8]*p.y; // 世界高度 = M 第三行作用在 (x,z,y)
+        float bz = prop.m[3]*p.x + prop.m[4]*p.z + prop.m[5]*p.y; // 世界水平 = M 第二行
         bx *= prop.scale[0]; by *= prop.scale[1]; bz *= prop.scale[2];
         float wx = prop.pos[0]+bx, wy = prop.pos[1]+by, wz = prop.pos[2]+bz;
-        // BRF -> 渲染坐标：x'=x, y'=z, z'=-y
-        verts.push_back(wx); verts.push_back(wz); verts.push_back(-wy);
+        // BRF -> 渲染坐标：x'=x, y'=z, z'=+y（场景物件经 S·M·S 后 y 即世界高度，取正）
+        verts.push_back(wx); verts.push_back(wz); verts.push_back(wy);
         float r = ((v.color) & 0xFF) / 255.0f;
         float g = ((v.color >> 8) & 0xFF) / 255.0f;
         float b = ((v.color >> 16) & 0xFF) / 255.0f;
         verts.push_back(r); verts.push_back(g); verts.push_back(b);
-        // 法线：同一旋转矩阵变换 + 坐标映射，归一化
-        float nx = prop.m[0]*v.normal.x + prop.m[1]*v.normal.y + prop.m[2]*v.normal.z;
-        float ny = prop.m[3]*v.normal.x + prop.m[4]*v.normal.y + prop.m[5]*v.normal.z;
-        float nz = prop.m[6]*v.normal.x + prop.m[7]*v.normal.y + prop.m[8]*v.normal.z;
+        // 法线：同一 S·M·S 变换 + 坐标映射，归一化
+        float nx = prop.m[0]*v.normal.x + prop.m[1]*v.normal.z + prop.m[2]*v.normal.y;
+        float ny = prop.m[6]*v.normal.x + prop.m[7]*v.normal.z + prop.m[8]*v.normal.y;
+        float nz = prop.m[3]*v.normal.x + prop.m[4]*v.normal.z + prop.m[5]*v.normal.y;
         float nl = sqrtf(nx*nx+ny*ny+nz*nz); if (nl < 1e-6f) nl = 1.f;
-        verts.push_back(nx/nl); verts.push_back(nz/nl); verts.push_back(-ny/nl);
+        verts.push_back(nx/nl); verts.push_back(nz/nl); verts.push_back(ny/nl);
         verts.push_back(v.uv.u); verts.push_back(v.uv.v);
     }
     if (!bodyName.empty() && bodyName != "0") {
         auto bit = g_bodies.find(bodyName);
         if (bit != g_bodies.end()) {
             auto xf = [&](brf::Vec3 p) {
-                float bx = prop.m[0]*p.x + prop.m[1]*p.y + prop.m[2]*p.z;
-                float bz = prop.m[6]*p.x + prop.m[7]*p.y + prop.m[8]*p.z;
+                float bx = prop.m[0]*p.x + prop.m[1]*p.z + prop.m[2]*p.y;
+                float bz = prop.m[3]*p.x + prop.m[4]*p.z + prop.m[5]*p.y;
                 bx *= prop.scale[0]; bz *= prop.scale[2];
                 return std::make_pair(prop.pos[0] + bx, prop.pos[2] + bz);
             };
             auto xfY = [&](brf::Vec3 p) {
-                float by = prop.m[3]*p.x + prop.m[4]*p.y + prop.m[5]*p.z;
+                float by = prop.m[6]*p.x + prop.m[7]*p.z + prop.m[8]*p.y;
                 by *= prop.scale[1];
                 return prop.pos[1] + by;
             };
-            float row1n = sqrtf(prop.m[3]*prop.m[3] + prop.m[4]*prop.m[4] + prop.m[5]*prop.m[5]);
+            float row1n = sqrtf(prop.m[6]*prop.m[6] + prop.m[7]*prop.m[7] + prop.m[8]*prop.m[8]);
             float maxScale = std::max({fabsf(prop.scale[0]), fabsf(prop.scale[1]), fabsf(prop.scale[2])});
             float rScale = std::max(prop.scale[0], prop.scale[2]);
             std::string owner = mesh.name + "[" + bodyName + "]";
@@ -1056,7 +1074,7 @@ static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<Groun
                 tint[2] = (col & 0xFF) / 255.0f;
             }
             float x = c[0]*cell, z = c[1]*cell, y = hAt(c[0], c[1]);
-            V.push_back(x); V.push_back(z); V.push_back(-y);
+            V.push_back(x); V.push_back(z); V.push_back(y);
             V.push_back(wt[0]); V.push_back(wt[1]); V.push_back(wt[2]);
             V.push_back(tint[0]); V.push_back(tint[1]); V.push_back(tint[2]);
             float lx = hAt(c[0]>0?c[0]-1:0, c[1]);
@@ -1421,43 +1439,84 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
     }
     // 2. SCO 物件
     sco::Scene scene = sco::load(scoPath);
-    std::set<std::string> need;
+    std::set<std::string> need, needBodies;
     for (auto& o : scene.objects) if (o.type==0) {
         auto it = sprMesh.find(o.id);
         if (it != sprMesh.end()) need.insert(it->second);
+        auto bit = sprBody.find(o.id);
+        if (bit != sprBody.end() && bit->second != "0") needBodies.insert(bit->second);
     }
-    std::fprintf(stderr, "需要网格 %zu 个\n", need.size());
+    std::fprintf(stderr, "需要网格 %zu 个 碰撞体 %zu 个\n", need.size(), needBodies.size());
+    // 大文件预过滤：只解析“文件里确实出现所需名字”的 brf（CV War 有大量高清材质大包，全扫会白屏几十秒）
+    auto fileContainsAny = [](const std::filesystem::path& p, const std::set<std::string>& keys) {
+        if (keys.empty()) return true;
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return false;
+        std::string hay((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        for (auto& k : keys)
+            if (k.size() >= 3 && hay.find(k) != std::string::npos) return true;
+        return false;
+    };
     // 2.5. 地面规格：游戏根 Data/ground_specs.txt（材质名稍后由 materials.brf 解析成 dds）
     std::filesystem::path gameRoot = std::filesystem::path(scoPath).parent_path().parent_path().parent_path().parent_path();
     std::vector<GroundSpec> gspecs = loadGroundSpecs((gameRoot / "Data" / "ground_specs.txt").string());
-    // 3. 扫描 CommonRes 所有 brf，收集需要的网格与材质定义
+    // 3. 先扫 CommonRes；仍缺的网格/碰撞体再去模组 Resource 按需找
+    //    （CV War Resource 有 16-36MB 高清材质大包，无差别全扫会白屏几十秒）
+    std::filesystem::path moduleDir = std::filesystem::path(scoPath).parent_path().parent_path();
+    std::vector<std::filesystem::path> resDirs = {
+        std::filesystem::path(commonRes),
+        moduleDir / "Resource",
+    };
+    std::set<std::string> missingMeshes = need, missingBodies = needBodies;
     int filesOk=0, filesFail=0;
-    for (auto& de : std::filesystem::directory_iterator(commonRes)) {
-        if (de.path().extension() != ".brf") continue;
-        bool meshesDone = need.empty();
-        if (!meshesDone && g_meshGroups.size() >= need.size()) {
-            meshesDone = true;
-            for (auto& n : need) if (!g_meshGroups.count(n)) { meshesDone=false; break; }
-        }
-        bool matsDone = gspecs.empty();
-        if (!matsDone) {
-            matsDone = true;
-            for (auto& g : gspecs) if (!g_materialDiffuse.count(g.mat)) { matsDone=false; break; }
-        }
-        if (meshesDone && matsDone) break;
-        try {
-            brf::BrfFile bf = brf::parse(de.path().string());
-            filesOk++;
-            for (auto& m : bf.meshes) {
-                if (meshIsLodVariant(m.name)) continue;
-                std::string base = meshBaseName(m.name);
-                if (need.count(base)) g_meshGroups[base].push_back(std::move(m));
+    for (size_t di = 0; di < resDirs.size(); di++) {
+        auto& resDir = resDirs[di];
+        if (!std::filesystem::exists(resDir)) continue;
+        bool isModuleRes = di == 1;
+        if (di == 1) {
+            bool groundMatsDone = true;
+            for (auto& g : gspecs) if (!g_materialDiffuse.count(g.mat)) { groundMatsDone = false; break; }
+            if (missingMeshes.empty() && missingBodies.empty() && groundMatsDone) {
+                std::fprintf(stderr, "CommonRes 已满足全部网格/碰撞体/地面材质，跳过模块 Resource\n");
+                break;
             }
-            for (auto& mt : bf.materials) if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
-            for (auto& bd : bf.bodies) if (!g_bodies.count(bd.name)) g_bodies[bd.name] = std::move(bd);
-        } catch (const std::exception&) { filesFail++; }
+            std::set<std::string> searchKeys = missingMeshes;
+            searchKeys.insert(missingBodies.begin(), missingBodies.end());
+            for (auto& de : std::filesystem::directory_iterator(resDir)) {
+                if (de.path().extension() != ".brf") continue;
+                if (!fileContainsAny(de.path(), searchKeys)) continue;
+                std::fprintf(stderr, "按需解析模块 brf: %s\n", de.path().filename().string().c_str());
+                try {
+                    brf::BrfFile bf = brf::parse(de.path().string());
+                    filesOk++;
+                    for (auto& m : bf.meshes) {
+                        if (meshIsLodVariant(m.name)) continue;
+                        std::string base = meshBaseName(m.name);
+                        if (need.count(base)) { g_meshGroups[base].push_back(std::move(m)); missingMeshes.erase(base); }
+                    }
+                    for (auto& mt : bf.materials) if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
+                    for (auto& bd : bf.bodies) if (!g_bodies.count(bd.name)) { g_bodies[bd.name] = std::move(bd); missingBodies.erase(bd.name); }
+                } catch (const std::exception&) { filesFail++; }
+            }
+            continue;
+        }
+        for (auto& de : std::filesystem::directory_iterator(resDir)) {
+            if (de.path().extension() != ".brf") continue;
+            try {
+                brf::BrfFile bf = brf::parse(de.path().string());
+                filesOk++;
+                for (auto& m : bf.meshes) {
+                    if (meshIsLodVariant(m.name)) continue;
+                    std::string base = meshBaseName(m.name);
+                    if (need.count(base)) { g_meshGroups[base].push_back(std::move(m)); missingMeshes.erase(base); }
+                }
+                for (auto& mt : bf.materials) if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
+                for (auto& bd : bf.bodies) if (!g_bodies.count(bd.name)) { g_bodies[bd.name] = std::move(bd); missingBodies.erase(bd.name); }
+            } catch (const std::exception&) { filesFail++; }
+        }
     }
-    std::fprintf(stderr, "扫描 brf：成功 %d 失败 %d，收集到基础网格 %zu / %zu\n", filesOk, filesFail, g_meshGroups.size(), need.size());
+    std::fprintf(stderr, "扫描 brf：成功 %d 失败 %d，收集到基础网格 %zu / %zu，仍缺网格 %zu 碰撞体 %zu\n",
+                 filesOk, filesFail, g_meshGroups.size(), need.size(), missingMeshes.size(), missingBodies.size());
     for (auto& g : gspecs) {
         auto it = g_materialDiffuse.find(g.mat);
         if (it != g_materialDiffuse.end()) g.diffuse = it->second;
@@ -1572,14 +1631,36 @@ static void recordCmdOne(App& A, size_t img) {
     vkEndCommandBuffer(A.cmds[img]);
 }
 
+static std::string sceneExeDir() {
+    char buf[MAX_PATH]; GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string p(buf);
+    size_t pos = p.find_last_of("\\/");
+    return pos == std::string::npos ? "." : p.substr(0, pos);
+}
+static void sceneLaunchAndExit(const std::string& exeName, const std::string& argline) {
+    std::string exe = sceneExeDir() + "\\" + exeName;
+    std::string cmd = "\"" + exe + "\" " + argline;
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessA(nullptr, (LPSTR)cmd.data(), nullptr, nullptr, FALSE, 0,
+                       nullptr, sceneExeDir().c_str(), &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        std::exit(0);
+    }
+    std::fprintf(stderr, "启动失败: %s\n", cmd.c_str());
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0); setvbuf(stderr, nullptr, _IONBF, 0);
-    if (argc < 5) { std::printf("usage: vk_scene <scene.sco> <scene_props.txt> <CommonRes目录> <Textures目录>\n"); return 1; }
+    SetUnhandledExceptionFilter(crashFilter);
+    if (argc < 5) { std::printf("usage: vk_scene <scene.sco> <scene_props.txt> <CommonRes目录> <Textures目录> [map.txt mapTextures fallbackTextures]\n"); return 1; }
+    std::string mapReturnArgs;
+    if (argc >= 7) mapReturnArgs = "\"" + std::string(argv[5]) + "\" \"" + std::string(argv[6]) + "\"";
     std::fprintf(stderr, "A: 解析场景 %s\n", argv[1]);
     App A; A.hInst = GetModuleHandleA(nullptr);
     WNDCLASSA wc{}; wc.lpfnWndProc=wndProc; wc.hInstance=A.hInst; wc.lpszClassName="vkSceneWnd";
     RegisterClassA(&wc);
-    A.hwnd = CreateWindowA("vkSceneWnd", "M&B 原版场景自研渲染", WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+    A.hwnd = CreateWindowA("vkSceneWnd", "M&B 原版场景自研渲染", WS_OVERLAPPEDWINDOW,
                           200, 100, 1280, 720, nullptr, nullptr, A.hInst, nullptr);
     std::fprintf(stderr, "C: initVk\n");
     initVk(A);
@@ -1596,7 +1677,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> ddsNames(needDds.begin(), needDds.end());
     if (ddsNames.empty()) ddsNames.push_back("shields");
     std::fprintf(stderr, "C2: 加载 %zu 张贴图\n", ddsNames.size());
-    initTextures(A, argv[4], ddsNames);
+    initTextures(A, argv[4], ddsNames, argc >= 8 ? argv[7] : "");
     std::fprintf(stderr, "D: initPipeline\n");
     initPipeline(A);
     for (auto& o : A.objs) {
@@ -1633,6 +1714,7 @@ int main(int argc, char** argv) {
         VkFenceCreateInfo af{}; af.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; // 初始 unsignaled，交给 acquire 使用
         vkCreateFence(A.dev, &af, nullptr, &A.acqFences[i]);
     }
+    ShowWindow(A.hwnd, SW_SHOW); UpdateWindow(A.hwnd); SetForegroundWindow(A.hwnd);
     std::fprintf(stderr, "G: 进入主循环（WASD 走角色，方向键绕角色转头，QE 拉近拉远，Shift 跑，ESC 退出）\n");
     MSG msg;
     uint32_t frame = 0;
@@ -1660,6 +1742,10 @@ int main(int argc, char** argv) {
         vkWaitForFences(A.dev, 1, &A.fences[img], VK_TRUE, UINT64_MAX);
         vkResetFences(A.dev, 1, &A.fences[img]);
         bool moving = updatePlayer(cam, dt);
+        if (!mapReturnArgs.empty() && (GetAsyncKeyState('M') & 0x8000)) {
+            std::fprintf(stderr, "M 返回大地图\n");
+            sceneLaunchAndExit("vk_map.exe", mapReturnArgs);
+        }
         if (!g_lastHit.empty()) {
             std::string title = "M&B 原生场景渲染 | 撞到: " + g_lastHit;
             SetWindowTextA(A.hwnd, title.c_str());

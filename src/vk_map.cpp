@@ -381,6 +381,82 @@ static void initVk(App& A) {
 #include <queue>
 #include <unordered_map>
 
+// ---------- CV War 定居点（town/castle/village）与地图图标 ----------
+struct Settlement {
+    std::string id, name, scene, meshName;
+    float x=0, y=0, scale=1.f;
+    size_t iconIdx=0;
+};
+
+static std::vector<Settlement> loadSettlements(const std::string& moduleDir) {
+    std::vector<Settlement> out;
+    std::map<std::string, std::pair<std::string,float>> icons; // map_icons 名 -> (mesh, scale)
+    {
+        std::ifstream f(moduleDir + "\\map_icons.txt");
+        std::string line; std::getline(f, line); int n; f >> n;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::istringstream ss(line);
+            std::string name; int flags; std::string mesh; float scale=0.35f;
+            if (!(ss >> name >> flags >> mesh)) continue;
+            ss >> scale;
+            icons[name] = {mesh, scale};
+        }
+    }
+    {
+        std::ifstream f(moduleDir + "\\parties.txt");
+        std::string line; std::getline(f, line);
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::vector<std::string> tok; std::string t;
+            while (ss >> t) tok.push_back(t);
+            if (tok.size() < 15) continue;
+            const std::string& pid = tok[3];
+            std::string scene, icon;
+            if (pid.rfind("p_town_", 0) == 0) {
+                std::string num = pid.substr(7);
+                scene = "scn_town_" + num + "_center";
+                icon = "moe_map_town_a";
+            } else if (pid.rfind("p_castle_", 0) == 0) {
+                std::string num = pid.substr(9);
+                scene = "scn_castle_" + num + "_exterior";
+                icon = "moe_map_castle_a";
+            } else if (pid.rfind("p_village_", 0) == 0) {
+                std::string num = pid.substr(10);
+                scene = "scn_village_" + num;
+                icon = "moe_map_village_a";
+            } else continue;
+            auto it = icons.find(icon);
+            if (it == icons.end()) continue;
+            Settlement s;
+            s.id = pid; s.name = tok[4]; s.scene = scene;
+            s.meshName = it->second.first; s.scale = it->second.second;
+            s.x = (float)atof(tok[14].c_str()); s.y = (float)atof(tok[15].c_str());
+            out.push_back(std::move(s));
+        }
+    }
+    return out;
+}
+
+static std::string exeDir() {
+    char buf[MAX_PATH]; GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    std::string p(buf);
+    size_t pos = p.find_last_of("\\/");
+    return pos == std::string::npos ? "." : p.substr(0, pos);
+}
+static void launchAndExit(const std::string& exeName, const std::string& argline) {
+    std::string exe = exeDir() + "\\" + exeName;
+    std::string cmd = "\"" + exe + "\" " + argline;
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessA(nullptr, (LPSTR)cmd.data(), nullptr, nullptr, FALSE, 0,
+                       nullptr, exeDir().c_str(), &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        std::exit(0);
+    }
+    std::fprintf(stderr, "启动失败: %s\n", cmd.c_str());
+}
+
 struct MapObj {
     VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE;
     VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE;
@@ -485,6 +561,51 @@ static void buildMapObjs(App& A, const MapData& md, std::vector<MapObj>& objs) {
         objs.push_back(std::move(o));
         std::fprintf(stderr, "地形[%d] %s 三角=%u\n", (int)t, mapTexture((int)t).first.c_str(), o.idxCount/3);
     }
+}
+
+// 定居点图标：把 moe_map_icons.brf 的网格平铺在地图平面上（x'=x*s, y'=z*s, z=2）
+static void buildSettlementIcons(App& A, std::vector<Settlement>& ss,
+                                 const std::string& moduleDir, std::vector<MapObj>& objs) {
+    std::map<std::string, brf::Mesh> meshes;
+    try {
+        brf::BrfFile bf = brf::parse(moduleDir + "\\Resource\\moe_map_icons.brf");
+        for (auto& m : bf.meshes) meshes[m.name] = std::move(m);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "图标 brf 解析失败: %s\n", e.what());
+        return;
+    }
+    auto ti = A.texIndex.find("fake_houses");
+    VkDescriptorSet iconDesc = A.texSets[ti != A.texIndex.end() ? ti->second : 0];
+    for (auto& s : ss) {
+        auto it = meshes.find(s.meshName);
+        if (it == meshes.end()) { std::fprintf(stderr, "缺图标网格 %s（%s）\n", s.meshName.c_str(), s.id.c_str()); continue; }
+        auto& m = it->second;
+        std::vector<float> verts; std::vector<uint32_t> idx;
+        verts.reserve(m.verts.size()*11);
+        for (auto& v : m.verts) {
+            if (v.index < 0 || (size_t)v.index >= m.positions.size()) continue;
+            auto& p = m.positions[(size_t)v.index];
+            verts.push_back(p.x*s.scale); verts.push_back(p.z*s.scale); verts.push_back(2.f);
+            verts.push_back(1.f); verts.push_back(1.f); verts.push_back(1.f);
+            verts.push_back(0.f); verts.push_back(0.f); verts.push_back(1.f);
+            verts.push_back(v.uv.u); verts.push_back(v.uv.v);
+        }
+        // 按原始索引复制时顶点顺序一致，直接沿用网格索引
+        idx.assign(m.indices.begin(), m.indices.end());
+        MapObj o;
+        makeBuffer(A, verts.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, o.vb, o.vm);
+        upload(A, o.vb, o.vm, verts.data(), verts.size()*4);
+        o.idxCount = (uint32_t)idx.size();
+        makeBuffer(A, o.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, o.ib, o.im);
+        upload(A, o.ib, o.im, idx.data(), o.idxCount*4);
+        o.descSet = iconDesc;
+        o.pc.resize(16, 0.f);
+        float M[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, s.x,s.y,2.f,1};
+        o.model.assign(M, M+16);
+        s.iconIdx = objs.size();
+        objs.push_back(std::move(o));
+    }
+    std::fprintf(stderr, "定居点图标 %zu/%zu 个已上屏\n", objs.size(), ss.size());
 }
 
 static void updateMapMVP(std::vector<MapObj>& objs, const float eye[3], const float target[3], float aspect) {
@@ -644,8 +765,22 @@ static void allocMapCmds(App& A) {
     A.cmds.resize(A.images.size());
     CHECK(vkAllocateCommandBuffers(A.dev, &ca, A.cmds.data()), "allocCmds");
 }
+static LONG WINAPI mapCrashFilter(EXCEPTION_POINTERS* ep) {
+    FILE* f = fopen("vk_map_crash.txt", "a");
+    if (f) {
+        std::fprintf(f, "exception code=0x%08lX addr=%p\n",
+                     (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+        void* stack[32];
+        USHORT n = CaptureStackBackTrace(0, 32, stack, nullptr);
+        for (USHORT i = 0; i < n; i++) std::fprintf(f, "  [%d] %p\n", (int)i, stack[i]);
+        std::fflush(f); fclose(f);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0); setvbuf(stderr, nullptr, _IONBF, 0);
+    SetUnhandledExceptionFilter(mapCrashFilter);
     if (argc < 3) { std::printf("usage: vk_map <map.txt> <Textures目录>\n"); return 1; }
     App A;
     A.hInst = GetModuleHandleA(nullptr);
@@ -659,8 +794,14 @@ int main(int argc, char** argv) {
     MapData md;
     try { md = loadMap(argv[1]); }
     catch (const std::exception& e) { std::fprintf(stderr, "地图加载失败: %s\n", e.what()); return 1; }
+    std::filesystem::path mapPath(argv[1]);
+    std::string moduleDir = mapPath.parent_path().string();          // Modules\CV War
+    std::string gameRoot = mapPath.parent_path().parent_path().parent_path().string(); // 游戏根
+    auto settlements = loadSettlements(moduleDir);
+    std::fprintf(stderr, "定居点 %zu 个（module=%s）\n", settlements.size(), moduleDir.c_str());
     std::set<std::string> texNames;
     for (size_t t=0;t<md.meshes.size();t++) if (!md.meshes[t].verts.empty()) texNames.insert(mapTexture((int)t).first);
+    texNames.insert("fake_houses"); // 定居点图标贴图（根 Textures）
     std::vector<std::string> names(texNames.begin(), texNames.end());
     std::fprintf(stderr, "地图 %zu 顶点 范围 x[%.0f..%.0f] y[%.0f..%.0f]\n",
         md.pos.size(), md.minX, md.maxX, md.minY, md.maxY);
@@ -668,6 +809,7 @@ int main(int argc, char** argv) {
     initMapPipeline(A);
     std::vector<MapObj> mapObjs;
     buildMapObjs(A, md, mapObjs);
+    buildSettlementIcons(A, settlements, moduleDir, mapObjs);
     size_t markerIdx = mapObjs.size();
     mapObjs.emplace_back();
     makeMarkerObj(A, mapObjs[markerIdx], names);
@@ -704,8 +846,8 @@ int main(int argc, char** argv) {
         float pan = dist*0.35f*dt;
         float fwx=sinf(yaw), fwy=cosf(yaw);
         float rx=cosf(yaw), ry=-sinf(yaw);
-        if (k('W')) { cx+=fwx*pan; cy+=fwy*pan; }
-        if (k('S')) { cx-=fwx*pan; cy-=fwy*pan; }
+        if (k('W')) { cx-=fwx*pan; cy-=fwy*pan; }
+        if (k('S')) { cx+=fwx*pan; cy+=fwy*pan; }
         if (k('D')) { cx+=rx*pan; cy+=ry*pan; }
         if (k('A')) { cx-=rx*pan; cy-=ry*pan; }
         if (k('E')) dist=std::max(120.f, dist-180.f*dt);
@@ -725,6 +867,28 @@ int main(int argc, char** argv) {
                                   (float)A.extent.width, (float)A.extent.height, hx, hy);
             g_click.x = -1; g_click.y = -1;
             if (hit) {
+                // 先看是否点到定居点图标 → 拉起对应场景（地图↔场景闭环）
+                bool entered = false;
+                for (auto& s : settlements) {
+                    float dx = hx - s.x, dy = hy - s.y;
+                    if (dx*dx + dy*dy > 9.f) continue;
+                    // 场景一律用 CV War 作者自己的布局（女王 2026-11-12 定：原版套用会冲突）
+                    std::string sco = moduleDir + "\\SceneObj\\" + s.scene + ".sco";
+                    if (!std::filesystem::exists(sco)) {
+                        std::fprintf(stderr, "%s 场景缺 %s，当普通移动\n", s.id.c_str(), s.scene.c_str());
+                        continue;
+                    }
+                    std::string argline =
+                        "\"" + sco + "\" \"" + moduleDir + "\\scene_props.txt\" \"" +
+                        gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
+                        std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
+                        gameRoot + "\\Textures\"";
+                    std::fprintf(stderr, "进入 %s (%s，CV War 布局)\n", s.name.c_str(), s.scene.c_str());
+                    launchAndExit("vk_scene.exe", argline);
+                    entered = true;
+                    break;
+                }
+                if (entered) continue;
                 int ff = nearestWalkableFace(md, g_mx, g_my);
                 int tf = nearestWalkableFace(md, hx, hy);
                 auto path = mapBfsPath(md, ff, tf);
