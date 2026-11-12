@@ -186,7 +186,7 @@ static inline Bone loadBone(Reader& r) {
     // 映射回欧几里得坐标 (X=第1值, Y=第3值, Z=第2值)
     auto rd3 = [&]() {
         float a = r.f32(), b = r.f32(), c = r.f32();
-        return Vec3{a, c, b};
+        return Vec3{a, b, c}; // 磁盘序 x,z,y → 欧几里得 (X=第1, Y=第3, Z=第2)
     };
     Vec3 px = rd3();
     Vec3 pz = rd3();
@@ -275,8 +275,8 @@ static inline SkeletonAnim loadSkeletonAnimOne(Reader& r) {
         boneSamples[i].resize(c);
         for (uint32_t j = 0; j < c; ++j) {
             int idx = r.i32();
-            // Point4f 磁盘序 Y,W,Z,X → 四元数 (X,Y,Z,W)
-            float yv = r.f32(), wv = r.f32(), zv = r.f32(), xv = r.f32();
+            // Point4f 磁盘序 Y,W,Z,X → 四元数 (x=第1值, y=第3值, z=第2值, w=第4值)
+            float xv = r.f32(), zv = r.f32(), yv = r.f32(), wv = r.f32();
             Quat q{xv, yv, zv, wv};
             q = adjustQuat(q);
             if (i == 0) q = adjustRootQuat(q);
@@ -288,7 +288,7 @@ static inline SkeletonAnim loadSkeletonAnimOne(Reader& r) {
     for (uint32_t j = 0; j < nTrans; ++j) {
         int idx = r.i32();
         float a = r.f32(), b = r.f32(), c = r.f32();
-        traSamples[j] = {idx, Vec3{a, c, b}}; // 磁盘序 x,z,y
+        traSamples[j] = {idx, Vec3{a, b, c}}; // 磁盘序 x,z,y → (X,Y,Z)
     }
     buildAnimFrames(boneSamples, traSamples, a);
     return a;

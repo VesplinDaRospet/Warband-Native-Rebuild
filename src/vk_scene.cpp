@@ -639,11 +639,13 @@ static bool updatePlayer(Cam& cam, float dt) {
     float ml = sqrtf(mx*mx + mz*mz);
     if (ml > 1e-6f) {
         moveCharBlocked(g_char.x + mx/ml * speed, g_char.z + mz/ml * speed);
-        float targetYaw = atan2f(-mx/ml, -mz/ml); // 模型前方 +y 的朝向
-        float dyaw = targetYaw - g_char.yaw;
-        while (dyaw > 3.14159f) dyaw -= 6.28318f;
-        while (dyaw < -3.14159f) dyaw += 6.28318f;
-        g_char.yaw += dyaw * std::min(1.f, 8.f*dt);
+        if (sz != 0.f) { // 纯 A/D 横移不转身（strafe），W/S 才转
+            float targetYaw = atan2f(-mx/ml, -mz/ml); // 模型前方 +y 的朝向
+            float dyaw = targetYaw - g_char.yaw;
+            while (dyaw > 3.14159f) dyaw -= 6.28318f;
+            while (dyaw < -3.14159f) dyaw += 6.28318f;
+            g_char.yaw += dyaw * std::min(1.f, 8.f*dt);
+        }
     }
     return true;
 }
@@ -864,9 +866,27 @@ static void loadCharSkin(const std::string& commonRes) {
 }
 
 // 蒙皮一帧，生成 11-float 渲染顶点（角色本地：前方 +y，脚底 z≈0）
-static void buildCharVerts(std::vector<float>& V) {
+static void buildCharVerts(std::vector<float>& V, bool tPose) {
     V.clear();
     const brf::Mesh& m = *g_charSkin.body;
+    if (tPose) {
+        // T-pose：直接用 BRF 原始顶点（临时保底；蒙皮动画在修）
+        float minZ = 1e9f;
+        for (size_t i = 0; i < m.verts.size(); i++) {
+            int idx = m.verts[i].index;
+            if (idx < 0 || (size_t)idx >= m.positions.size()) continue;
+            auto& p = m.positions[idx];
+            auto& n = m.verts[i].normal;
+            V.push_back(p.x); V.push_back(p.z); V.push_back(p.y);
+            uint32_t c = m.verts[i].color;
+            V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
+            V.push_back(n.x); V.push_back(n.z); V.push_back(n.y);
+            V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
+            minZ = std::min(minZ, p.y);
+        }
+        for (size_t i = 0; i < V.size(); i += 11) V[i+2] -= minZ;
+        return;
+    }
     std::vector<skin::M44> ag, skm;
     const brf::AnimFrame& fr = g_charSkin.anim->frames[g_charSkin.frame % g_charSkin.anim->frames.size()];
     skin::animGlobals(*g_charSkin.skel, fr, ag);
@@ -915,7 +935,7 @@ static void makeBoxCharObj(App& A) {
 static void makeCharObj(App& A, std::set<std::string>& needDds) {
     if (!g_charSkin.ok) { makeBoxCharObj(A); return; }
     std::vector<float> V;
-    buildCharVerts(V);
+    buildCharVerts(V, true); // 临时 T-pose，蒙皮矩阵在修
     App::Obj obj;
     obj.diffName = g_charSkin.diffuse;
     needDds.insert(obj.diffName);
@@ -938,7 +958,7 @@ static void updateCharAnim(App& A, float dt, bool moving) {
     else g_charSkin.t = 0.f;
     g_charSkin.frame = (size_t)g_charSkin.t;
     std::vector<float> V;
-    buildCharVerts(V);
+    buildCharVerts(V, true); // 临时 T-pose，蒙皮矩阵在修
     for (auto& o : A.objs) {
         if (!o.charAnim) continue;
         upload(A, o.vb, o.vm, V.data(), V.size()*4);
@@ -947,8 +967,19 @@ static void updateCharAnim(App& A, float dt, bool moving) {
 static void setCharModel(App::Obj& o, const Char& ch) {
     float cy = cosf(ch.yaw), sy = sinf(ch.yaw);
     float h = terrainHeightAt(ch.x, ch.z);
-    // 列主序 model：先绕高度轴转 yaw，再平移（渲染坐标 y=世界南北）
-    float M[16] = { cy, sy, 0, 0,  -sy, cy, 0, 0,  0,0,1,0,  ch.x, ch.z, h, 1 };
+    float M[16];
+    if (o.charAnim) {
+        // 原版模型脸朝 -y：model 里先绕高度轴转 180°，让脸跟移动方向一致
+        M[0]=-cy; M[1]=-sy; M[2]=0; M[3]=0;
+        M[4]= sy; M[5]=-cy; M[6]=0; M[7]=0;
+        M[8]=0; M[9]=0; M[10]=1; M[11]=0;
+        M[12]=ch.x; M[13]=ch.z; M[14]=h; M[15]=1;
+    } else {
+        M[0]=cy; M[1]=sy; M[2]=0; M[3]=0;
+        M[4]=-sy; M[5]=cy; M[6]=0; M[7]=0;
+        M[8]=0; M[9]=0; M[10]=1; M[11]=0;
+        M[12]=ch.x; M[13]=ch.z; M[14]=h; M[15]=1;
+    }
     o.model.assign(M, M+16);
 }
 

@@ -66,33 +66,34 @@ inline void xformDir(const M44& m, brf::Vec3& n) {
     n.z = m.m[2]*x + m.m[6]*y + m.m[10]*z;
 }
 
-// 骨骼 bind 旋转：3x3 列主序的转置（R^T）
+// 骨骼 bind 旋转：列主序存 R^T（col k = R 的第 k 行，与 quatT 约定一致）
 inline M44 boneBindT(const brf::Bone& b) {
     M44 r{};
-    r.m[0] = b.col0.x; r.m[1] = b.col1.x; r.m[2] = b.col2.x;
-    r.m[4] = b.col0.y; r.m[5] = b.col1.y; r.m[6] = b.col2.y;
-    r.m[8] = b.col0.z; r.m[9] = b.col1.z; r.m[10] = b.col2.z;
+    r.m[0] = b.col0.x; r.m[1] = b.col0.y; r.m[2] = b.col0.z;
+    r.m[4] = b.col1.x; r.m[5] = b.col1.y; r.m[6] = b.col1.z;
+    r.m[8] = b.col2.x; r.m[9] = b.col2.y; r.m[10] = b.col2.z;
     r.m[15] = 1.f;
     return r;
 }
 
-// 动画四元数(x,y,z,w) → 3x3 列主序旋转，再转置（R^T）
+// 动画四元数(x,y,z,w) → 3x3 旋转，列主序存 R^T（与 bind 的 R^T 约定一致）
 inline M44 quatT(brf::Quat q) {
     float x = q.x, y = q.y, z = q.z, w = q.w;
-    float r[9] = {
-        1-2*(y*y+z*z), 2*(x*y+z*w), 2*(x*z-y*w),
-        2*(x*y-z*w), 1-2*(x*x+z*z), 2*(y*z+x*w),
-        2*(x*z+y*w), 2*(y*z-x*w), 1-2*(x*x+y*y),
+    float r[9] = { // 标准旋转矩阵，行主序
+        1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w),
+        2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w),
+        2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y),
     };
     M44 m{};
-    m.m[0] = r[0]; m.m[1] = r[3]; m.m[2] = r[6];
-    m.m[4] = r[1]; m.m[5] = r[4]; m.m[7] = r[7];
-    m.m[8] = r[2]; m.m[9] = r[5]; m.m[10] = r[8];
+    // 列主序存 R^T：col k = R 的第 k 行（与 boneBindT 约定一致）
+    m.m[0] = r[0]; m.m[1] = r[1]; m.m[2] = r[2];
+    m.m[4] = r[3]; m.m[5] = r[4]; m.m[6] = r[5];
+    m.m[8] = r[6]; m.m[9] = r[7]; m.m[10] = r[8];
     m.m[15] = 1.f;
     return m;
 }
 
-// bind 全局：G[i] = G[parent] * T(t[i]) * R[i]^T
+// bind 全局（列主序：col(A*B)=col(B)*col(A)，故 local × parent）
 inline void bindGlobals(const brf::Skeleton& s, std::vector<M44>& out) {
     out.assign(s.bones.size(), identity());
     if (s.root < 0) return;
@@ -101,12 +102,12 @@ inline void bindGlobals(const brf::Skeleton& s, std::vector<M44>& out) {
         int i = stack.back(); stack.pop_back();
         const brf::Bone& b = s.bones[i];
         M44 par = (b.attach >= 0) ? out[b.attach] : identity();
-        out[i] = mul(par, mul(translate(b.t.x, b.t.y, b.t.z), boneBindT(b)));
+        out[i] = mul(mul(translate(b.t.x, b.t.y, b.t.z), boneBindT(b)), par);
         for (int c : b.children) stack.push_back(c);
     }
 }
 
-// 动画全局：G[i] = G[parent] * T(tra)(仅根) * T(t[i]) * Q[i]^T
+// 动画全局（列主序：local × parent）
 inline void animGlobals(const brf::Skeleton& s, const brf::AnimFrame& fr, std::vector<M44>& out) {
     out.assign(s.bones.size(), identity());
     if (s.root < 0) return;
@@ -117,18 +118,18 @@ inline void animGlobals(const brf::Skeleton& s, const brf::AnimFrame& fr, std::v
         M44 par = (b.attach >= 0) ? out[b.attach] : identity();
         M44 rootT = (i == s.root) ? translate(fr.tra.x, fr.tra.y, fr.tra.z) : identity();
         if ((size_t)i >= fr.rots.size()) { out[i] = par; continue; }
-        out[i] = mul(par, mul(mul(rootT, translate(b.t.x, b.t.y, b.t.z)), quatT(fr.rots[i])));
+        out[i] = mul(mul(mul(rootT, translate(b.t.x, b.t.y, b.t.z)), quatT(fr.rots[i])), par);
         for (int c : b.children) stack.push_back(c);
     }
 }
 
-// 蒙皮矩阵 = 动画全局 * bind全局^-1
+// 蒙皮矩阵 = bind全局^-1 × 动画全局（列主序存储下，等价行主序的 anim × bind^-1）
 inline void skinMatrices(const std::vector<M44>& bind, const std::vector<M44>& anim,
                          std::vector<M44>& out) {
     out.resize(anim.size());
     for (size_t i = 0; i < anim.size(); i++) {
         M44 ib = (i < bind.size()) ? invertAffine(bind[i]) : identity();
-        out[i] = mul(anim[i], ib);
+        out[i] = mul(ib, anim[i]);
     }
 }
 
