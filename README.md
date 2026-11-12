@@ -32,19 +32,31 @@ original .dds textures ──► in-house DXT1/3/5 software decoder (dds.h)
 > **MIT coverage**: the MIT license applies only to original code authored by the project author.
 > Full compliance policy, prohibited contributions, and enforcement rules: see **[COMPLIANCE.md](COMPLIANCE.md)**.
 
+### World map / 大地图
+
+`vk_map` parses a module's `map.txt` (vertex + triangle mesh, each triangle tagged with a terrain code) and renders the campaign map, grouping triangles by terrain type and applying the matching ground texture. Camera: **WASD** pan, **QE** zoom, **arrow keys** rotate, **ESC** exit. **Click** anywhere on walkable land to move the yellow marker along a BFS path over shared triangle edges; water and river triangles are impassable.
+
+```
+vk_map "<module>\map.txt" "<game root>\Textures"
+```
+
+Game files such as `map.txt` and `.dds` textures are **not** distributed with this repository; point the tool at your own game installation.
+
 ### Layout
 
 - `src/`
   - `brf.h` — BRF container parser (mesh/material/texture/shader/skeleton etc., independent implementation)
   - `dds.h` — DDS DXT1/3/5 software decoder to RGBA8
   - `sco.h` — SceneObj parser (objects + ai_mesh skip + all terrain layers)
+  - `map.h` — campaign `map.txt` parser (vertices, triangles, terrain codes)
   - `vk_scene.cpp` — main scene renderer
+  - `vk_map.cpp` — campaign map renderer with click-to-move BFS pathfinding
   - `vk_mesh.cpp` — minimal single-mesh + texture validation program
   - `brf_dump / obj_export / dds_dump / sco_dump` — format validation tools
   - `vk_probe.cpp` — Vulkan toolchain smoke test (dynamically loads vulkan-1.dll)
   - `tmp_terrain.cpp` / `tmp_test.cpp` — terrain-layer / BRF-parse diagnostics
   - `shot.ps1` — captures the vkSceneWnd window (`-OutDir` chooses the output folder, default `shots/`)
-- `shader/` — GLSL sources (`lit.*` = directional light version; `mesh.*`/`tex.*` = unlit validation versions)
+- `shader/` — GLSL sources (`lit.*` = directional light version; `ground.*` = 3-texture terrain blending; `mesh.*`/`tex.*` = unlit validation versions)
 - `tools/shader-tool/` — GLSL → SPIR-V compiler tool (npm `@webgpu/glslang`)
 
 ### Build
@@ -124,19 +136,31 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 > **MIT 覆盖范围**：MIT 许可证仅适用于由本项目作者原创的代码。
 > 完整合规政策、禁止行为与执行规则见 **[COMPLIANCE.md](COMPLIANCE.md)**。
 
+## 大地图 / World map
+
+`vk_map` 解析模组的 `map.txt`（顶点 + 三角形网格，每个三角形带地形码），按地形分组贴图渲染战役大地图。相机：**WASD** 平移，**QE** 缩放，**方向键** 旋转，**ESC** 退出。**点击**可走陆地上的任意位置，黄色标记沿三角形共享边做 BFS 寻路移动；水域与河流不可通行。
+
+```
+vk_map "<模组目录>\map.txt" "<游戏根目录>\Textures"
+```
+
+`map.txt`、`.dds` 等游戏文件**不随本仓库分发**，请把工具指向你自己的游戏安装。
+
 ## 目录
 
 - `src/`
   - `brf.h` —— BRF 容器解析器（mesh/material/texture/shader/skeleton 等，独立实现）
   - `dds.h` —— DDS DXT1/3/5 软件解码为 RGBA8
   - `sco.h` —— SceneObj 解析器（物件 + ai_mesh 跳过 + terrain 全层）
+  - `map.h` —— 战役大地图 `map.txt` 解析器（顶点、三角形、地形码）
   - `vk_scene.cpp` —— 场景渲染主程序
+  - `vk_map.cpp` —— 大地图渲染 + 点击寻路（BFS）
   - `vk_mesh.cpp` —— 单网格+贴图最小验证程序
   - `brf_dump / obj_export / dds_dump / sco_dump` —— 格式验证工具
   - `vk_probe.cpp` —— Vulkan 链路自检（动态加载 vulkan-1.dll）
   - `tmp_terrain.cpp` / `tmp_test.cpp` —— 地形分层 / BRF 连通性诊断
   - `shot.ps1` —— 截取 vkSceneWnd 窗口（`-OutDir` 指定输出目录，默认 `shots/`）
-- `shader/` —— GLSL 源（`lit.*` 为方向光版本；`mesh.*`/`tex.*` 为无光验证版本）
+- `shader/` —— GLSL 源（`lit.*` 为方向光版本；`ground.*` 为三贴图地形混合；`mesh.*`/`tex.*` 为无光验证版本）
 - `tools/shader-tool/` —— GLSL → SPIR-V 编译工具（npm `@webgpu/glslang`）
 
 ## 构建
