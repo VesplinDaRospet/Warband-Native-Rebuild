@@ -161,9 +161,11 @@ static inline void skipBody(Reader& r) {
 // adjust(v) = (v.z, -v.y, v.x)；用于非根骨与动画四元数
 static inline Vec3 adjustSk(Vec3 v) { return Vec3{v.z, -v.y, v.x}; }
 static inline Vec3 negV(Vec3 v) { return Vec3{-v.x, -v.y, -v.z}; }
-// 动画四元数调整：q' = (q.x, q.w, -q.z, q.y)
-static inline Quat adjustQuat(Quat q) { return Quat{q.x, q.w, -q.z, q.y}; }
-// 根骨四元数再左乘 q0=(0, s, 0, s)，s=1/sqrt(2)，标准 Hamilton 乘法
+// 动画四元数调整（vcg Point4f 分量序 w,x,y,z 下的 (p0,p3,-p2,p1)）：
+// q' = (q.z, -q.y, q.x, q.w)，且两次复合 = 恒等（与 OpenBRF AdjustInv 一致）
+static inline Quat adjustQuat(Quat q) { return Quat{q.z, -q.y, q.x, q.w}; }
+// 根骨四元数再右乘 q0（vcg Quaternionf(0,s,0,s)：w=0,x=s,y=0,z=s）
+// = 本结构 (x=s, y=0, z=s, w=0)，s=1/sqrt(2)，标准 Hamilton 乘法
 static inline Quat quatMul(Quat a, Quat b) {
     return Quat{
         a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
@@ -174,7 +176,7 @@ static inline Quat quatMul(Quat a, Quat b) {
 }
 static inline Quat adjustRootQuat(Quat q) {
     constexpr float s = 0.7071067811865476f;
-    return quatMul(q, Quat{0.f, s, 0.f, s});
+    return quatMul(q, Quat{s, 0.f, s, 0.f});
 }
 
 static inline Bone loadBone(Reader& r) {
@@ -182,16 +184,12 @@ static inline Bone loadBone(Reader& r) {
     bn.attach = r.i32();
     uint32_t probe = r.u32();
     if (probe > 0 && probe < 99) { bn.name = r.strBody(probe); bn.b = r.i32(); }
-    // 磁盘上是 4 组 vec3，依次名为 x,z,y,t；每组内按 x,z,y 磁盘序直读，
-    // 映射回欧几里得坐标 (X=第1值, Y=第3值, Z=第2值)
-    auto rd3 = [&]() {
-        float a = r.f32(), b = r.f32(), c = r.f32();
-        return Vec3{a, b, c}; // 磁盘序 x,z,y → 欧几里得 (X=第1, Y=第3, Z=第2)
-    };
-    Vec3 px = rd3();
-    Vec3 pz = rd3();
-    Vec3 py = rd3();
-    Vec3 pt = rd3();
+    // 磁盘上是 4 组 vec3，依次名为 x,z,y,t；每组按 Point3f 磁盘序 x,z,y 读取
+    // → 欧几里得 (X=f0, Y=f2, Z=f1)，与网格顶点同一套读取规则
+    Vec3 px = r.point3();
+    Vec3 pz = r.point3();
+    Vec3 py = r.point3();
+    Vec3 pt = r.point3();
     if (bn.attach >= 0) {
         bn.col0 = adjustSk(pz);
         bn.col1 = negV(adjustSk(py));
@@ -287,8 +285,7 @@ static inline SkeletonAnim loadSkeletonAnimOne(Reader& r) {
     std::vector<std::pair<int, Vec3>> traSamples(nTrans);
     for (uint32_t j = 0; j < nTrans; ++j) {
         int idx = r.i32();
-        float a = r.f32(), b = r.f32(), c = r.f32();
-        traSamples[j] = {idx, Vec3{a, b, c}}; // 磁盘序 x,z,y → (X,Y,Z)
+        traSamples[j] = {idx, r.point3()}; // Point3f 磁盘序 x,z,y → (X,Y,Z)，不做坐标系调整
     }
     buildAnimFrames(boneSamples, traSamples, a);
     return a;

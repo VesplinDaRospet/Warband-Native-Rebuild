@@ -66,7 +66,8 @@ inline void xformDir(const M44& m, brf::Vec3& n) {
     n.z = m.m[2]*x + m.m[6]*y + m.m[10]*z;
 }
 
-// 骨骼 bind 旋转：列主序存 R^T（col k = R 的第 k 行，与 quatT 约定一致）
+// 骨骼 bind 旋转：列主序，列 = (col0,col1,col2)（与 ref 四元数调整组合后自洽；
+// 探针验证：该组合 frame0 skin trace≈2.42、其余约定均 ≪3）
 inline M44 boneBindT(const brf::Bone& b) {
     M44 r{};
     r.m[0] = b.col0.x; r.m[1] = b.col0.y; r.m[2] = b.col0.z;
@@ -123,13 +124,13 @@ inline void animGlobals(const brf::Skeleton& s, const brf::AnimFrame& fr, std::v
     }
 }
 
-// 蒙皮矩阵 = bind全局^-1 × 动画全局（列主序存储下，等价行主序的 anim × bind^-1）
+// 蒙皮矩阵 = 动画全局 × bind全局^-1（OpenBRF：res[i] = anim[i] * Inverse(bind[i])）
 inline void skinMatrices(const std::vector<M44>& bind, const std::vector<M44>& anim,
                          std::vector<M44>& out) {
     out.resize(anim.size());
     for (size_t i = 0; i < anim.size(); i++) {
         M44 ib = (i < bind.size()) ? invertAffine(bind[i]) : identity();
-        out[i] = mul(ib, anim[i]);
+        out[i] = mul(anim[i], ib);
     }
 }
 

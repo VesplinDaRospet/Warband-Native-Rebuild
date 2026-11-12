@@ -866,46 +866,30 @@ static void loadCharSkin(const std::string& commonRes) {
 }
 
 // 蒙皮一帧，生成 11-float 渲染顶点（角色本地：前方 +y，脚底 z≈0）
+// tPose=false 走骨骼蒙皮；顶点映射与 T-pose 分支完全相同（朝向公式勿再改）
 static void buildCharVerts(std::vector<float>& V, bool tPose) {
     V.clear();
     const brf::Mesh& m = *g_charSkin.body;
-    if (tPose) {
-        // T-pose：直接用 BRF 原始顶点（临时保底；蒙皮动画在修）
-        float minZ = 1e9f;
-        for (size_t i = 0; i < m.verts.size(); i++) {
-            int idx = m.verts[i].index;
-            if (idx < 0 || (size_t)idx >= m.positions.size()) continue;
-            auto& p = m.positions[idx];
-            auto& n = m.verts[i].normal;
-            V.push_back(p.x); V.push_back(p.z); V.push_back(p.y);
-            uint32_t c = m.verts[i].color;
-            V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
-            V.push_back(n.x); V.push_back(n.z); V.push_back(n.y);
-            V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
-            minZ = std::min(minZ, p.y);
-        }
-        for (size_t i = 0; i < V.size(); i += 11) V[i+2] -= minZ;
-        return;
-    }
     std::vector<skin::M44> ag, skm;
-    const brf::AnimFrame& fr = g_charSkin.anim->frames[g_charSkin.frame % g_charSkin.anim->frames.size()];
-    skin::animGlobals(*g_charSkin.skel, fr, ag);
-    skin::skinMatrices(g_charSkin.bind, ag, skm);
     std::vector<brf::Vec3> op, on;
-    skin::skinMesh(m, skm, op, on);
+    if (!tPose) {
+        const brf::AnimFrame& fr = g_charSkin.anim->frames[g_charSkin.frame % g_charSkin.anim->frames.size()];
+        skin::animGlobals(*g_charSkin.skel, fr, ag);
+        skin::skinMatrices(g_charSkin.bind, ag, skm);
+        skin::skinMesh(m, skm, op, on);
+    }
     float minZ = 1e9f;
     for (size_t i = 0; i < m.verts.size(); i++) {
         int idx = m.verts[i].index;
-        if (idx < 0 || (size_t)idx >= op.size()) continue;
-        // OpenBRF -> 角色本地渲染坐标：ob=(x,y,z) -> render=(z,x,y)，再绕高度轴 -90° 使前方(-x)转到 +y
-        brf::Vec3 p = op[idx], n = on[i];
-        brf::Vec3 rp{p.x, -p.z, p.y}, rn{n.x, -n.z, n.y};
-        minZ = std::min(minZ, rp.z);
-        V.push_back(rp.x); V.push_back(rp.y); V.push_back(rp.z);
+        if (idx < 0 || (size_t)idx >= m.positions.size()) continue;
+        brf::Vec3 p = tPose ? m.positions[idx] : op[idx];
+        brf::Vec3 n = tPose ? m.verts[i].normal : on[i];
+        V.push_back(p.x); V.push_back(p.z); V.push_back(p.y);
         uint32_t c = m.verts[i].color;
         V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
-        V.push_back(rn.x); V.push_back(rn.y); V.push_back(rn.z);
+        V.push_back(n.x); V.push_back(n.z); V.push_back(n.y);
         V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
+        minZ = std::min(minZ, p.y);
     }
     for (size_t i = 0; i < V.size(); i += 11) V[i+2] -= minZ; // 脚底贴地
 }
@@ -932,10 +916,11 @@ static void makeBoxCharObj(App& A) {
     A.objs.push_back(std::move(obj));
     std::fprintf(stderr, "占位角色 顶点=%zu 三角形=%zu\n", V.size()/11, I.size()/3);
 }
+static bool charTposeDebug() { static bool v = getenv("VK_TPOSE") != nullptr; return v; }
 static void makeCharObj(App& A, std::set<std::string>& needDds) {
     if (!g_charSkin.ok) { makeBoxCharObj(A); return; }
     std::vector<float> V;
-    buildCharVerts(V, true); // 临时 T-pose，蒙皮矩阵在修
+    buildCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     App::Obj obj;
     obj.diffName = g_charSkin.diffuse;
     needDds.insert(obj.diffName);
@@ -958,7 +943,7 @@ static void updateCharAnim(App& A, float dt, bool moving) {
     else g_charSkin.t = 0.f;
     g_charSkin.frame = (size_t)g_charSkin.t;
     std::vector<float> V;
-    buildCharVerts(V, true); // 临时 T-pose，蒙皮矩阵在修
+    buildCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     for (auto& o : A.objs) {
         if (!o.charAnim) continue;
         upload(A, o.vb, o.vm, V.data(), V.size()*4);
@@ -1188,6 +1173,10 @@ int main(int argc, char** argv) {
     loadSceneAssets(A, argv[1], argv[2], argv[3], sceneCX, sceneCZ, needDds);
     loadCharSkin(argv[3]);
     makeCharObj(A, needDds);
+    if (getenv("VK_CHAR_ONLY")) { // 调试：只画角色，便于检查蒙皮姿态
+        A.objs.erase(std::remove_if(A.objs.begin(), A.objs.end(),
+            [](const App::Obj& o) { return !o.charAnim; }), A.objs.end());
+    }
     std::vector<std::string> ddsNames(needDds.begin(), needDds.end());
     if (ddsNames.empty()) ddsNames.push_back("shields");
     std::fprintf(stderr, "C2: 加载 %zu 张贴图\n", ddsNames.size());
