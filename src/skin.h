@@ -94,7 +94,7 @@ inline M44 quatT(brf::Quat q) {
     return m;
 }
 
-// bind 全局（列主序：col(A*B)=col(B)*col(A)，故 local × parent）
+// bind 全局（OpenBRF：output[bi] = curr * T(t) * R，即 父 × 本地）
 inline void bindGlobals(const brf::Skeleton& s, std::vector<M44>& out) {
     out.assign(s.bones.size(), identity());
     if (s.root < 0) return;
@@ -103,12 +103,12 @@ inline void bindGlobals(const brf::Skeleton& s, std::vector<M44>& out) {
         int i = stack.back(); stack.pop_back();
         const brf::Bone& b = s.bones[i];
         M44 par = (b.attach >= 0) ? out[b.attach] : identity();
-        out[i] = mul(mul(translate(b.t.x, b.t.y, b.t.z), boneBindT(b)), par);
+        out[i] = mul(par, mul(translate(b.t.x, b.t.y, b.t.z), boneBindT(b)));
         for (int c : b.children) stack.push_back(c);
     }
 }
 
-// 动画全局（列主序：local × parent）
+// 动画全局（OpenBRF：curr(=父) * rootT(仅根) * T(t) * Q^T，即 父 × 本地）
 inline void animGlobals(const brf::Skeleton& s, const brf::AnimFrame& fr, std::vector<M44>& out) {
     out.assign(s.bones.size(), identity());
     if (s.root < 0) return;
@@ -119,7 +119,7 @@ inline void animGlobals(const brf::Skeleton& s, const brf::AnimFrame& fr, std::v
         M44 par = (b.attach >= 0) ? out[b.attach] : identity();
         M44 rootT = (i == s.root) ? translate(fr.tra.x, fr.tra.y, fr.tra.z) : identity();
         if ((size_t)i >= fr.rots.size()) { out[i] = par; continue; }
-        out[i] = mul(mul(mul(rootT, translate(b.t.x, b.t.y, b.t.z)), quatT(fr.rots[i])), par);
+        out[i] = mul(par, mul(mul(rootT, translate(b.t.x, b.t.y, b.t.z)), quatT(fr.rots[i])));
         for (int c : b.children) stack.push_back(c);
     }
 }
