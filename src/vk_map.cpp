@@ -817,6 +817,7 @@ static float g_battleTimer = 0.f;      // 遭遇后停留 1.5 秒自动进战斗
 static bool g_battleLaunched = false;
 static std::string g_battleResult;     // 战斗结算："胜"/"败"（vk_scene 回传）
 static std::string g_deadParty;        // 被消灭的野队名
+static float g_battleGrace = 0.f;      // 战斗返回后的免遭遇宽限期（防失败后立刻再被卷入）
 static float g_hour = 6.f;      // 游戏时间：第 g_day 天 g_hour 时
 static int g_day = 1;
 
@@ -1082,6 +1083,7 @@ int main(int argc, char** argv) {
     if (argc >= 7) { // 战斗结算回传（ASCII：win/lose + 野队名）
         g_battleResult = (std::string(argv[5]) == "win") ? "胜" : (std::string(argv[5]) == "lose" ? "败" : std::string(argv[5]));
         g_deadParty = argv[6];
+        g_battleGrace = 15.f; // 刚打完出来，15 秒内不再自动进战斗
     }
     if (!posWalkable(md, g_mx, g_my)) {
         int f = nearestWalkableFace(md, g_mx, g_my);
@@ -1129,7 +1131,7 @@ int main(int argc, char** argv) {
                                         icons[(size_t)ap.icon].scale, ap.x, ap.y, 3.f, mapObjs);
             else ap.objIdx = (size_t)-1;
             ap.badgeIdx = makeBadgeObj(A, whiteDesc, 1.f, 0.12f, 0.12f, 2.2f, ap.x, ap.y, 15.f, mapObjs);
-            if (!g_deadParty.empty() && ap.name == g_deadParty) {
+            if (!g_deadParty.empty() && g_battleResult == "胜" && ap.name == g_deadParty) {
                 ap.dead = true;
                 std::fprintf(stderr, "[结算] %s 已被消灭\n", ap.name.c_str());
             }
@@ -1217,7 +1219,7 @@ int main(int argc, char** argv) {
         float simDt = g_paused ? 0.f : dt;
 
         // 游戏时间：1 秒 = 1 小时
-        if (simDt > 0.f) { g_hour += simDt; while (g_hour >= 24.f) { g_hour -= 24.f; g_day++; } }
+        if (simDt > 0.f) { g_hour += simDt; while (g_hour >= 24.f) { g_hour -= 24.f; g_day++; } if (g_battleGrace > 0.f) g_battleGrace -= simDt; }
 
         // 相机围绕玩家队伍，QE 缩放 / 方向键视角
         // 缩放时高度跟着比例走（俯角不变），拉到最远时地图仍铺满屏幕而不是压成一条线
@@ -1336,7 +1338,7 @@ int main(int argc, char** argv) {
                 ap.hold = true;
                 g_way.clear(); g_wayIdx = 0; g_pendingSettlement = -1;
                 setMarkerModel(mapObjs[markerIdx], g_mx, g_my, -999.f);
-                g_battleTimer += simDt;
+                if (g_battleGrace <= 0.f) g_battleTimer += simDt;
             } else if (ap.hold && d2 > 4.84f) {
                 ap.hold = false; ap.wait = 1.5f;
             }
