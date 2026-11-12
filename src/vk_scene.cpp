@@ -479,9 +479,12 @@ static sco::AiMesh g_aiMesh;
 // 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf / meshes_face_gen.brf）
 struct CharSkin {
     bool ok = false;
-    brf::BrfFile skelFile, animFile, bodyFile, faceFile;
+    brf::BrfFile skelFile, animFile, bodyFile, faceFile, standFile, runFile;
     brf::Skeleton* skel = nullptr;
-    brf::SkeletonAnim* anim = nullptr;
+    brf::SkeletonAnim* anim = nullptr;      // man_walk（走路）
+    brf::SkeletonAnim* standAnim = nullptr; // stand_man（静止）
+    brf::SkeletonAnim* runAnim = nullptr;   // run_man_forward（跑步）
+    brf::SkeletonAnim* curAnim = nullptr;
     brf::Mesh* body = nullptr;
     // 部件列表：0=body 蒙皮；其余为无蒙皮的附属部件，整体跟随 bone（骨骼全局 × 固定旋转）
     struct Part { const brf::Mesh* mesh = nullptr; int bone = -1; std::string diff = "snow"; bool mirror = false; bool isHead = false; };
@@ -862,10 +865,15 @@ static void loadCharSkin(const std::string& commonRes) {
         g_charSkin.animFile = brf::parse(commonRes + "/ani_man_walk.brf");
         g_charSkin.bodyFile = brf::parse(commonRes + "/body_meshes.brf");
         g_charSkin.faceFile = brf::parse(commonRes + "/meshes_face_gen.brf");
+        g_charSkin.standFile = brf::parse(commonRes + "/ani_stand.brf");
+        g_charSkin.runFile = brf::parse(commonRes + "/ani_run_p.brf");
         for (auto& s : g_charSkin.skelFile.skeletons) if (s.name == "skel_human") { g_charSkin.skel = &s; break; }
         for (auto& a : g_charSkin.animFile.anims) if (a.name == "man_walk") { g_charSkin.anim = &a; break; }
+        for (auto& a : g_charSkin.standFile.anims) if (a.name == "stand_man") { g_charSkin.standAnim = &a; break; }
+        for (auto& a : g_charSkin.runFile.anims) if (a.name == "run_man_forward") { g_charSkin.runAnim = &a; break; }
         for (auto& m : g_charSkin.bodyFile.meshes) if (m.name == "man_body") { g_charSkin.body = &m; break; }
-        if (!g_charSkin.skel || !g_charSkin.anim || !g_charSkin.body) {
+        g_charSkin.curAnim = g_charSkin.standAnim;
+        if (!g_charSkin.skel || !g_charSkin.anim || !g_charSkin.standAnim || !g_charSkin.runAnim || !g_charSkin.body) {
             std::fprintf(stderr, "原版角色资源不完整（skel/anim/body），回退占位 box 人\n");
             g_charSkin.ok = false;
             return;
@@ -902,9 +910,12 @@ static void loadCharSkin(const std::string& commonRes) {
         addPart(g_charSkin.bodyFile.meshes, "m_handR", "hand.R", g_charSkin.diffuse);
         addPart(g_charSkin.faceFile.meshes, "male_head", "head", "manface_young", true, true); // 头网格是半脸，引擎镜像补全
         g_charSkin.ok = true;
-        std::fprintf(stderr, "原版角色: %s(%zu骨) + %s(%zu帧) + 部件%zu: ",
+        std::fprintf(stderr, "原版角色: %s(%zu骨) stand=%s(%zu帧) walk=%s(%zu帧) run=%s(%zu帧) 部件%zu: ",
             g_charSkin.skel->name.c_str(), g_charSkin.skel->bones.size(),
-            g_charSkin.anim->name.c_str(), g_charSkin.anim->frames.size(), g_charSkin.parts.size());
+            g_charSkin.standAnim->name.c_str(), g_charSkin.standAnim->frames.size(),
+            g_charSkin.anim->name.c_str(), g_charSkin.anim->frames.size(),
+            g_charSkin.runAnim->name.c_str(), g_charSkin.runAnim->frames.size(),
+            g_charSkin.parts.size());
         for (auto& p : g_charSkin.parts)
             std::fprintf(stderr, "[%s/%s] ", p.mesh->name.c_str(), p.diff.c_str());
         std::fprintf(stderr, "\n");
@@ -919,7 +930,7 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
     out.assign(g_charSkin.parts.size(), {});
     std::vector<skin::M44> ag, skm;
     if (!tPose) {
-        const brf::AnimFrame& fr = g_charSkin.anim->frames[g_charSkin.frame % g_charSkin.anim->frames.size()];
+        const brf::AnimFrame& fr = g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()];
         skin::animGlobals(*g_charSkin.skel, fr, ag);
         skin::skinMatrices(g_charSkin.bind, ag, skm);
     }
@@ -1068,9 +1079,16 @@ static void makeCharObj(App& A, std::set<std::string>& needDds) {
 }
 static void updateCharAnim(App& A, float dt, bool moving) {
     if (!g_charSkin.ok) return;
-    if (moving) g_charSkin.t += dt * 30.f * (GetAsyncKeyState(VK_SHIFT) & 0x8000 ? 1.8f : 1.f);
-    else g_charSkin.t = 0.f;
-    g_charSkin.frame = (size_t)g_charSkin.t;
+    bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    brf::SkeletonAnim* want = moving ? (shift ? g_charSkin.runAnim : g_charSkin.anim) : g_charSkin.standAnim;
+    if (want != g_charSkin.curAnim) { g_charSkin.curAnim = want; g_charSkin.t = 0.f; }
+    if (moving) {
+        float speed = shift ? 1.9f : 1.0f; // run 比 walk 快；stand 不播放（静止停 frame0）
+        g_charSkin.t += dt * 30.f * speed;
+    } else {
+        g_charSkin.t = 0.f;
+    }
+    g_charSkin.frame = (size_t)g_charSkin.t % g_charSkin.curAnim->frames.size();
     std::vector<std::vector<float>> V;
     buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     for (auto& o : A.objs) {
