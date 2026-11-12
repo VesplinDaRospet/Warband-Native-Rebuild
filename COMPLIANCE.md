@@ -12,8 +12,8 @@
 
 This repository contains **only original code and documentation**.
 It includes no Mount&Blade copyrighted assets (models/textures/scene files), no translated
-Native module TXT content, and no local paths or personal information. At runtime, point it
-at a game directory that you legally own.
+module TXT content (official or third-party), no generated TXT-to-code conversions, and no
+local paths or personal information. At runtime, point it at a game directory that you legally own.
 
 This repository is an independent project with no affiliation with or endorsement from TaleWorlds Entertainment.
 
@@ -43,6 +43,7 @@ This project maintains a **zero-tolerance policy** for compliance violations.
 The following are strictly prohibited and will be removed or blocked immediately:
 - Submitting, requesting, or distributing any official game files, assets, data, or executables;
 - Submitting unauthorized proprietary code, decompiled or disassembled code obtained without authorization, cracked files, or copyrighted extracted content;
+- Submitting converted, translated, or generated code/data derived from official or third-party module TXT files (this repository accepts only hand-written original code and documentation);
 - Using this repository to facilitate piracy, license circumvention, or IP infringement.
 
 Violations of these rules will result in immediate content removal and, for repeat or serious offenders, permanent bans.
@@ -65,7 +66,7 @@ Third parties who use, modify, or distribute this code are solely responsible fo
 ### 合法范围
 
 本仓库**只包含自研代码与文档**。不含任何 Mount&Blade 版权资产（模型/贴图/场景文件），
-不含 Native 模块 TXT 翻译内容，不含本地路径或个人信息。
+不含任何模组（官方或第三方）TXT 翻译内容，不含由 TXT 生成的代码转换产物，也不含本地路径或个人信息。
 运行时请在你自己合法拥有的游戏目录上指定资源路径。
 
 本仓库是与 TaleWorlds Entertainment 无任何关联、亦未获其背书的独立项目。
@@ -93,6 +94,7 @@ MIT 许可证不适用于：
 以下行为严格禁止，一经发现立即删除或阻断：
 - 提交、索要或分发任何官方游戏文件、资产、数据或可执行文件；
 - 提交未经授权取得的专有代码、未经授权获取的反编译或反汇编代码、破解文件，以及受版权保护的提取内容；
+- 提交由官方或第三方模组 TXT 文件转换、翻译或生成的代码/数据（本仓库只接受从零手写的自研代码与文档）；
 - 利用本仓库协助盗版、绕过授权或侵犯知识产权。
 
 违反上述规则的内容将被立即移除；重复或严重违规者将被永久封禁。
