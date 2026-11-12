@@ -56,6 +56,15 @@ struct MaterialEntry {
     uint32_t flags = 0; float specular = 0, r = 1, g = 1, b = 1;
 };
 
+// ---------- 碰撞体（body；格式事实来自公开 OpenBRF 代码，独立实现） ----------
+struct BodyPart {
+    int type = 0;            // 0=sphere 1=capsule 2=manifold/face
+    float radius = 0.f;
+    Vec3 c, d;               // capsule：两端点；sphere：球心
+    std::vector<Vec3> pts;   // manifold/face：顶点
+};
+struct Body { std::string name; std::vector<BodyPart> parts; };
+
 // ---------- 骨骼 / 动画（独立实现；格式事实来自公开 OpenBRF 文档与代码行为） ----------
 struct Quat { float x = 0, y = 0, z = 0, w = 1; };
 
@@ -93,6 +102,7 @@ struct BrfFile {
     std::vector<MaterialEntry> materials;
     std::vector<Skeleton> skeletons;
     std::vector<SkeletonAnim> anims;
+    std::vector<Body> bodies;
     std::vector<std::string> unknownTokens;
 };
 
@@ -132,28 +142,52 @@ private:
 
 inline Vec2 uvFlipped(Vec2 p) { p.v = 1.f - p.v; return p; }
 
-// ---------- 跳过不需要的对象类型（skeleton / skeleton_anim / body）----------
-static inline void skipBodyPart(Reader& r, const std::string& first) {
+// ---------- 碰撞体解析（body） ----------
+static inline BodyPart loadBodyPart(Reader& r, const std::string& first) {
+    BodyPart p;
     std::string t = first.empty() ? r.str() : first;
-    if (t == "manifold") {
-        uint32_t n = r.u32(); r.skip((size_t)n*12);
-        int32_t k = r.i32();
-        for (int32_t i=0;i<k;i++) { r.skip(8); uint32_t c = r.u32(); r.skip((size_t)c*4); }
-    } else if (t == "capsule") { r.skip(32); }
-    else if (t == "sphere") { r.skip(20); }
-    else if (t == "face") { uint32_t n = r.u32(); r.skip((size_t)n*12); r.skip(4); }
-    else throw std::runtime_error("BRF: 未知碰撞体类型 " + t);
+    if (t == "manifold" || t == "face") {
+        p.type = 2;
+        uint32_t n = r.u32();
+        p.pts.resize(n);
+        for (auto& v : p.pts) v = r.point3();
+        if (t == "manifold") {
+            int32_t k = r.i32();
+            for (int32_t i = 0; i < k; i++) {
+                r.i32(); r.i32();            // ori, flags
+                uint32_t c = r.u32();
+                for (uint32_t j = 0; j < c; j++) r.i32(); // face 索引（碰撞只取顶点集）
+            }
+        } else {
+            r.u32(); // flags
+        }
+    } else if (t == "capsule") {
+        p.type = 1;
+        p.radius = r.f32();
+        p.c = r.point3();
+        p.d = r.point3();
+        r.u32(); // flags
+    } else if (t == "sphere") {
+        p.type = 0;
+        p.radius = r.f32();
+        p.c = r.point3();
+        r.u32(); // flags
+    } else throw std::runtime_error("BRF: 未知碰撞体类型 " + t);
+    return p;
 }
-static inline void skipBody(Reader& r) {
+static inline void loadBodies(Reader& r, BrfFile& b) {
     uint32_t count = r.u32();
-    for (uint32_t i=0;i<count;i++) {
-        r.str(); // name
+    b.bodies.resize(count);
+    for (auto& body : b.bodies) {
+        body.name = r.str();
         std::string first = r.str();
         if (first == "composite") {
             uint32_t n = r.u32();
-            for (uint32_t j=0;j<n;j++) skipBodyPart(r, "");
+            body.parts.resize(n);
+            for (auto& p : body.parts) p = loadBodyPart(r, "");
         } else {
-            skipBodyPart(r, first);
+            body.parts.resize(1);
+            body.parts[0] = loadBodyPart(r, first);
         }
     }
 }
@@ -387,7 +421,7 @@ inline BrfFile parse(const std::string& path, bool verbose = false) {
         } else if (token == "skeleton_anim") {
             loadSkeletonAnims(r, b);
         } else if (token == "body") {
-            skipBody(r);
+            loadBodies(r, b);
         } else {
             b.unknownTokens.push_back(token);
             if (verbose) std::printf("  [未知 token，停止]\n");

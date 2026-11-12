@@ -514,6 +514,17 @@ static skin::M44 g_partFixHead = []() {
 }();
 static int32_t g_lastFace = -1;
 static std::vector<int32_t> g_path; static size_t g_pathIdx = 0; static bool g_wasG = false;
+// v0.2-1：prop 碰撞 = 游戏原生 bo_xxx 碰撞体（sphere/capsule/manifold）投影到渲染 x/z 平面
+struct ColShape {
+    int type = 0;             // 0=圆 1=胶囊(线段) 2=多边形
+    float r = 0.f;
+    float ax = 0, az = 0;     // 圆心或线段端点 A
+    float bx = 0, bz = 0;     // 线段端点 B
+    std::vector<std::pair<float,float>> pts; // 多边形
+};
+static std::map<uint32_t, std::vector<ColShape>> g_propColMap;
+static std::map<std::string, brf::Body> g_bodies;
+static const float g_charRadius = 0.35f;
 
 // 点是否在导航面多边形内（凸多边形叉积同号）
 static bool pointInFace(const sco::AiMesh& m, int32_t fi, float x, float z) {
@@ -542,11 +553,68 @@ static int32_t findFace(float x, float z) {
     return -1;
 }
 // 碰撞：先整体移动；不行则分别只动 x / 只动 z（沿墙滑动）；都不行原地不动
+static float pointSegDist2(float x, float z, float ax, float az, float bx, float bz) {
+    float dx = bx-ax, dz = bz-az;
+    float len2 = dx*dx + dz*dz;
+    float t = len2 > 1e-9f ? ((x-ax)*dx + (z-az)*dz) / len2 : 0.f;
+    t = std::max(0.f, std::min(1.f, t));
+    float px = ax + t*dx, pz = az + t*dz;
+    return (x-px)*(x-px) + (z-pz)*(z-pz);
+}
+static bool pointInPoly(float x, float z, const std::vector<std::pair<float,float>>& pts) {
+    bool inside = false;
+    for (size_t i = 0, j = pts.size()-1; i < pts.size(); j = i++) {
+        float xi = pts[i].first, zi = pts[i].second, xj = pts[j].first, zj = pts[j].second;
+        if (((zi > z) != (zj > z)) && (x < (xj-xi)*(z-zi)/(zj-zi+1e-9f)+xi)) inside = !inside;
+    }
+    return inside;
+}
+static bool circleHitsShape(float x, float z, const ColShape& s) {
+    float rr = g_charRadius;
+    if (s.type == 0) {
+        float dx = x-s.ax, dz = z-s.az;
+        float R = s.r + rr;
+        return dx*dx + dz*dz < R*R;
+    }
+    if (s.type == 1) {
+        float R = s.r + rr;
+        return pointSegDist2(x, z, s.ax, s.az, s.bx, s.bz) < R*R;
+    }
+    if (pointInPoly(x, z, s.pts)) return true;
+    for (size_t i = 0, j = s.pts.size()-1; i < s.pts.size(); j = i++)
+        if (pointSegDist2(x, z, s.pts[i].first, s.pts[i].second, s.pts[j].first, s.pts[j].second) < rr*rr) return true;
+    return false;
+}
+static bool blockedByProps(float x, float z) {
+    for (auto& kv : g_propColMap)
+        for (auto& s : kv.second)
+            if (circleHitsShape(x, z, s)) return true;
+    return false;
+}
+static bool freeAt(float x, float z) {
+    if (g_aiMesh.ok && findFace(x, z) < 0) return false; // 导航网格：不可走面
+    return !blockedByProps(x, z);                          // prop 包围盒：真墙体
+}
 static void moveCharBlocked(float nx, float nz) {
-    if (!g_aiMesh.ok) { g_char.x=nx; g_char.z=nz; return; } // 无导航网格的内景：自由移动
-    if (findFace(nx, nz) >= 0) { g_char.x=nx; g_char.z=nz; return; }
-    if (findFace(nx, g_char.z) >= 0) { g_char.x=nx; return; }
-    if (findFace(g_char.x, nz) >= 0) { g_char.z=nz; return; }
+    if (freeAt(nx, nz)) { g_char.x=nx; g_char.z=nz; return; }
+    if (freeAt(nx, g_char.z)) { g_char.x=nx; return; }
+    if (freeAt(g_char.x, nz)) { g_char.z=nz; return; }
+}
+// 安全出生点：离首选点最近的、圆碰撞体不与任何 prop 盒相交的导航面中心
+static void safeSpawn(float preferX, float preferZ) {
+    if (!g_aiMesh.ok) { g_char.x = preferX; g_char.z = preferZ; return; }
+    float bestD = 1e18f; bool found = false; float bx = preferX, bz = preferZ;
+    for (auto& fc : g_aiMesh.faces) {
+        float cx = 0, cz = 0; int n = 0;
+        for (uint32_t vi : fc.verts) if (vi < g_aiMesh.vertX.size()) { cx += g_aiMesh.vertX[vi]; cz += g_aiMesh.vertY[vi]; n++; }
+        if (!n) continue;
+        cx /= n; cz /= n;
+        if (!freeAt(cx, cz)) continue;
+        float d = (cx-preferX)*(cx-preferX) + (cz-preferZ)*(cz-preferZ);
+        if (d < bestD) { bestD = d; bx = cx; bz = cz; found = true; }
+    }
+    g_char.x = bx; g_char.z = bz;
+    if (!found) std::fprintf(stderr, "警告：没找到无 prop 的导航面，出生在 (%.1f,%.1f)\n", preferX, preferZ);
 }
 static void faceCenter(int32_t fi, float& x, float& z) {
     x=z=0; int n=0;
@@ -686,8 +754,9 @@ static bool meshIsLodVariant(const std::string& name) {
     return (s[1]=='l'||s[1]=='L') && (s[2]=='o'||s[2]=='O') && (s[3]=='d'||s[3]=='D') && isdigit((unsigned char)s[4]);
 }
 
-// 生成一个场景物件实例的 GPU 缓冲与 MVP
-static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, float cx, float cz) {
+// 生成一个场景物件实例的 GPU 缓冲与 MVP（boxIdx = 实例序号；bodyName = bo_xxx 碰撞体名，空则不参与碰撞）
+static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, float cx, float cz,
+                         uint32_t boxIdx, const std::string& bodyName) {
     std::vector<float> verts; verts.reserve(mesh.verts.size()*11);
     for (auto& v : mesh.verts) {
         if (v.index < 0 || (size_t)v.index >= mesh.positions.size()) continue;
@@ -711,6 +780,25 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
         float nl = sqrtf(nx*nx+ny*ny+nz*nz); if (nl < 1e-6f) nl = 1.f;
         verts.push_back(nx/nl); verts.push_back(nz/nl); verts.push_back(-ny/nl);
         verts.push_back(v.uv.u); verts.push_back(v.uv.v);
+    }
+    if (!bodyName.empty() && bodyName != "0") {
+        auto bit = g_bodies.find(bodyName);
+        if (bit != g_bodies.end()) {
+            auto xf = [&](brf::Vec3 p) {
+                float bx = prop.m[0]*p.x + prop.m[1]*p.y + prop.m[2]*p.z;
+                float bz = prop.m[6]*p.x + prop.m[7]*p.y + prop.m[8]*p.z;
+                bx *= prop.scale[0]; bz *= prop.scale[2];
+                return std::make_pair(prop.pos[0] + bx, prop.pos[2] + bz);
+            };
+            float rScale = std::max(prop.scale[0], prop.scale[2]);
+            for (auto& part : bit->second.parts) {
+                ColShape s;
+                if (part.type == 0) { s.type = 0; auto p = xf(part.c); s.ax = p.first; s.az = p.second; s.r = part.radius*rScale; }
+                else if (part.type == 1) { s.type = 1; auto a = xf(part.c), b = xf(part.d); s.ax=a.first; s.az=a.second; s.bx=b.first; s.bz=b.second; s.r = part.radius*rScale; }
+                else { s.type = 2; for (auto& p : part.pts) { auto q = xf(p); s.pts.push_back(q); } }
+                g_propColMap[boxIdx].push_back(s);
+            }
+        }
     }
     App::Obj obj;
     std::string diff = "shields";
@@ -1146,8 +1234,8 @@ static void makeSkyObj(App& A, const brf::Mesh& mesh, float cx, float cz, std::s
 static void loadSceneAssets(App& A, const std::string& scoPath, const std::string& propsPath,
                             const std::string& commonRes, float& sceneCX, float& sceneCZ,
                             std::set<std::string>& needDds) {
-    // 1. scene_props.txt：spr id -> mesh 名
-    std::map<uint32_t, std::string> sprMesh;
+    // 1. scene_props.txt：spr id -> mesh 名 / 碰撞体名
+    std::map<uint32_t, std::string> sprMesh, sprBody;
     {
         std::ifstream pf(propsPath);
         std::string line; std::getline(pf, line); int n; pf >> n;
@@ -1158,7 +1246,9 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
             std::string idstr; int flags, x, y;
             std::string mesh, body;
             ss >> idstr >> flags >> x >> mesh >> body >> y;
-            sprMesh[idx++] = mesh;
+            sprMesh[idx] = mesh;
+            sprBody[idx] = body;
+            idx++;
         }
     }
     // 2. SCO 物件
@@ -1196,6 +1286,7 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
                 if (need.count(base)) g_meshGroups[base].push_back(std::move(m));
             }
             for (auto& mt : bf.materials) if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
+            for (auto& bd : bf.bodies) if (!g_bodies.count(bd.name)) g_bodies[bd.name] = std::move(bd);
         } catch (const std::exception&) { filesFail++; }
     }
     std::fprintf(stderr, "扫描 brf：成功 %d 失败 %d，收集到基础网格 %zu / %zu\n", filesOk, filesFail, g_meshGroups.size(), need.size());
@@ -1224,6 +1315,7 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
                  (mnx+mxx)/2, (mnz+mxz)/2, tcx, tcz, sceneCX, sceneCZ);
     // 5. 生成物件
     size_t made=0;
+    g_propColMap.clear();
     for (auto& o : scene.objects) {
         if (o.type!=0) continue;
         auto it = sprMesh.find(o.id);
@@ -1233,11 +1325,17 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
         for (auto& piece : git->second) {
             auto dit2 = g_materialDiffuse.find(piece.material);
             if (dit2 != g_materialDiffuse.end() && !dit2->second.empty() && dit2->second != "none") needDds.insert(dit2->second);
-            makeSceneObj(A, piece, o, sceneCX, sceneCZ);
+            uint32_t boxIdx = (uint32_t)(&o - scene.objects.data());
+            auto bit = sprBody.find(o.id);
+            std::string bodyName = (bit != sprBody.end()) ? bit->second : "0";
+            makeSceneObj(A, piece, o, sceneCX, sceneCZ, boxIdx, bodyName);
         }
         made++;
     }
-    std::fprintf(stderr, "场景物件实例 %zu 个已建缓冲\n", made);
+    size_t colCount = 0;
+    for (auto& kv : g_propColMap) colCount += kv.second.size();
+    std::fprintf(stderr, "场景物件实例 %zu 个已建缓冲，prop 碰撞体 %zu 个（%zu 实例，bo 碰撞体 %zu 个）\n",
+                 made, colCount, g_propColMap.size(), g_bodies.size());
     if (hasTerrain) {
         makeGroundObj(A, g_terrain, gspecs, sceneCX, sceneCZ, needDds);
     } else {
@@ -1337,7 +1435,8 @@ int main(int argc, char** argv) {
     }
     std::fprintf(stderr, "F: allocCmds\n");
     allocCmds(A);
-    g_char.x = sceneCX; g_char.z = sceneCZ;
+    safeSpawn(sceneCX, sceneCZ);
+    std::fprintf(stderr, "出生点 (%.1f,%.1f)（原中心 %.1f,%.1f）\n", g_char.x, g_char.z, sceneCX, sceneCZ);
     for (auto& o : A.objs) {
         if (!o.model.empty()) setCharModel(o, g_char);
         auto ti = A.texIndex.find(o.diffName);
