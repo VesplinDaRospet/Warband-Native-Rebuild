@@ -62,6 +62,7 @@ struct BodyPart {
     float radius = 0.f;
     Vec3 c, d;               // capsule：两端点；sphere：球心
     std::vector<Vec3> pts;   // manifold/face：顶点
+    std::vector<std::vector<int32_t>> faces; // manifold：每个小面的顶点索引（face 类型为空=整块 pts 即一个面）
 };
 struct Body { std::string name; std::vector<BodyPart> parts; };
 
@@ -153,10 +154,12 @@ static inline BodyPart loadBodyPart(Reader& r, const std::string& first) {
         for (auto& v : p.pts) v = r.point3();
         if (t == "manifold") {
             int32_t k = r.i32();
+            p.faces.resize((size_t)(k > 0 ? k : 0));
             for (int32_t i = 0; i < k; i++) {
                 r.i32(); r.i32();            // ori, flags
                 uint32_t c = r.u32();
-                for (uint32_t j = 0; j < c; j++) r.i32(); // face 索引（碰撞只取顶点集）
+                p.faces[(size_t)i].resize(c);
+                for (uint32_t j = 0; j < c; j++) p.faces[(size_t)i][j] = r.i32();
             }
         } else {
             r.u32(); // flags

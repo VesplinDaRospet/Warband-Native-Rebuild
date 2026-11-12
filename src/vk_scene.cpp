@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
 #include <algorithm>
 #include <array>
 #include <filesystem>
@@ -520,7 +521,9 @@ struct ColShape {
     float r = 0.f;
     float ax = 0, az = 0;     // 圆心或线段端点 A
     float bx = 0, bz = 0;     // 线段端点 B
+    float yMin = -1e9f, yMax = 1e9f; // 世界 y 垂直范围：只挡与角色身高范围有重叠的
     std::vector<std::pair<float,float>> pts; // 多边形
+    std::string owner;        // 诊断：哪个 mesh 的哪个 body
 };
 static std::map<uint32_t, std::vector<ColShape>> g_propColMap;
 static std::map<std::string, brf::Body> g_bodies;
@@ -585,18 +588,45 @@ static bool circleHitsShape(float x, float z, const ColShape& s) {
         if (pointSegDist2(x, z, s.pts[i].first, s.pts[i].second, s.pts[j].first, s.pts[j].second) < rr*rr) return true;
     return false;
 }
-static bool blockedByProps(float x, float z) {
+static bool verticalOverlap(const ColShape& s, float y0, float y1) {
+    return s.yMax >= y0 && s.yMin <= y1;
+}
+static const ColShape* blockedByProps(float x, float z, float y0, float y1) {
     for (auto& kv : g_propColMap)
         for (auto& s : kv.second)
-            if (circleHitsShape(x, z, s)) return true;
-    return false;
+            if (verticalOverlap(s, y0, y1) && circleHitsShape(x, z, s)) return &s;
+    return nullptr;
 }
+static float terrainHeightAt(float x, float z);
+// v0.2-1 关键修正：ai_mesh 是给 NPC 寻路用的，不是玩家活动边界。
+// 玩家在场景里应像原版一样只被真实墙体/道具挡住，不再被导航面边界做成空气墙。
 static bool freeAt(float x, float z) {
-    if (g_aiMesh.ok && findFace(x, z) < 0) return false; // 导航网格：不可走面
-    return !blockedByProps(x, z);                          // prop 包围盒：真墙体
+    float foot = terrainHeightAt(x, z);
+    return blockedByProps(x, z, foot, foot + 1.9f) == nullptr;
+}
+static float clampToTerrain(float v, bool xAxis) {
+    if (g_terrain.width < 2 || g_terrain.height < 2) return v;
+    float lim = xAxis ? g_terrain.width*2.0f : g_terrain.height*2.0f;
+    return std::max(0.f, std::min(v, lim));
+}
+static std::string g_lastHit;
+static void logBlocked(const ColShape* s, float x, float z) {
+    static double last = -1e9; static float lx=1e9f, lz=1e9f;
+    double now = (double)clock() / CLOCKS_PER_SEC;
+    float dx = x-lx, dz = z-lz;
+    if (s && (now-last > 0.5 || dx*dx+dz*dz > 4.f)) {
+        last = now; lx=x; lz=z;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s @(%.0f,%.0f)", s->owner.c_str(), x, z);
+        g_lastHit = buf;
+        std::fprintf(stderr, "[撞] %s type=%d r=%.2f\n", buf, s->type, s->r);
+    }
 }
 static void moveCharBlocked(float nx, float nz) {
+    nx = clampToTerrain(nx, true); nz = clampToTerrain(nz, false);
     if (freeAt(nx, nz)) { g_char.x=nx; g_char.z=nz; return; }
+    float foot = terrainHeightAt(nx, nz);
+    const ColShape* hit = blockedByProps(nx, nz, foot, foot + 1.9f); logBlocked(hit, nx, nz);
     if (freeAt(nx, g_char.z)) { g_char.x=nx; return; }
     if (freeAt(g_char.x, nz)) { g_char.z=nz; return; }
 }
@@ -790,13 +820,62 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
                 bx *= prop.scale[0]; bz *= prop.scale[2];
                 return std::make_pair(prop.pos[0] + bx, prop.pos[2] + bz);
             };
+            auto xfY = [&](brf::Vec3 p) {
+                float by = prop.m[3]*p.x + prop.m[4]*p.y + prop.m[5]*p.z;
+                by *= prop.scale[1];
+                return prop.pos[1] + by;
+            };
+            float row1n = sqrtf(prop.m[3]*prop.m[3] + prop.m[4]*prop.m[4] + prop.m[5]*prop.m[5]);
+            float maxScale = std::max({fabsf(prop.scale[0]), fabsf(prop.scale[1]), fabsf(prop.scale[2])});
             float rScale = std::max(prop.scale[0], prop.scale[2]);
+            std::string owner = mesh.name + "[" + bodyName + "]";
             for (auto& part : bit->second.parts) {
-                ColShape s;
-                if (part.type == 0) { s.type = 0; auto p = xf(part.c); s.ax = p.first; s.az = p.second; s.r = part.radius*rScale; }
-                else if (part.type == 1) { s.type = 1; auto a = xf(part.c), b = xf(part.d); s.ax=a.first; s.az=a.second; s.bx=b.first; s.bz=b.second; s.r = part.radius*rScale; }
-                else { s.type = 2; for (auto& p : part.pts) { auto q = xf(p); s.pts.push_back(q); } }
-                g_propColMap[boxIdx].push_back(s);
+                if (part.type == 0) {
+                    ColShape s; s.type = 0; s.owner = owner;
+                    auto p = xf(part.c); s.ax = p.first; s.az = p.second; s.r = part.radius*rScale;
+                    float cy = xfY(part.c), ry = part.radius * row1n * maxScale;
+                    s.yMin = cy - ry; s.yMax = cy + ry;
+                    g_propColMap[boxIdx].push_back(s);
+                } else if (part.type == 1) {
+                    ColShape s; s.type = 1; s.owner = owner;
+                    auto a = xf(part.c), b = xf(part.d);
+                    s.ax=a.first; s.az=a.second; s.bx=b.first; s.bz=b.second; s.r = part.radius*rScale;
+                    float ry = part.radius * row1n * maxScale;
+                    float y0 = xfY(part.c), y1 = xfY(part.d);
+                    s.yMin = std::min(y0, y1) - ry; s.yMax = std::max(y0, y1) + ry;
+                    g_propColMap[boxIdx].push_back(s);
+                } else {
+                    auto addFace = [&](const std::vector<std::pair<float,float>>& fp, float y0, float y1) {
+                        if (fp.size() < 3) return;
+                        ColShape s; s.type = 2; s.owner = owner; s.pts = fp;
+                        s.yMin = y0; s.yMax = y1;
+                        g_propColMap[boxIdx].push_back(s);
+                    };
+                    auto faceYs = [&](const std::vector<int32_t>& face, const std::vector<std::pair<float,float>>& fp) {
+                        float y0 = 1e9f, y1 = -1e9f;
+                        for (int32_t fi : face)
+                            if (fi >= 0 && (size_t)fi < part.pts.size()) {
+                                float y = xfY(part.pts[(size_t)fi]);
+                                y0 = std::min(y0, y); y1 = std::max(y1, y);
+                            }
+                        if (y0 > y1) { y0 = y1 = 0.f; }
+                        addFace(fp, y0, y1);
+                    };
+                    if (part.faces.empty()) {
+                        std::vector<std::pair<float,float>> fp;
+                        float y0 = 1e9f, y1 = -1e9f;
+                        for (auto& p : part.pts) { auto q = xf(p); fp.push_back(q); y0 = std::min(y0, xfY(p)); y1 = std::max(y1, xfY(p)); }
+                        if (y0 > y1) { y0 = y1 = 0.f; }
+                        addFace(fp, y0, y1);
+                    } else {
+                        for (auto& face : part.faces) {
+                            std::vector<std::pair<float,float>> fp;
+                            for (int32_t fi : face)
+                                if (fi >= 0 && (size_t)fi < part.pts.size()) { auto q = xf(part.pts[(size_t)fi]); fp.push_back(q); }
+                            faceYs(face, fp);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1487,6 +1566,10 @@ int main(int argc, char** argv) {
         vkWaitForFences(A.dev, 1, &A.fences[img], VK_TRUE, UINT64_MAX);
         vkResetFences(A.dev, 1, &A.fences[img]);
         bool moving = updatePlayer(cam, dt);
+        if (!g_lastHit.empty()) {
+            std::string title = "M&B 原生场景渲染 | 撞到: " + g_lastHit;
+            SetWindowTextA(A.hwnd, title.c_str());
+        }
         updateCharAnim(A, dt, moving);
         for (auto& o : A.objs) if (!o.model.empty()) setCharModel(o, g_char);
         playerFrame(g_char, cam, eye, tgt);
