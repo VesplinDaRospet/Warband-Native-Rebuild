@@ -640,7 +640,7 @@ static bool updatePlayer(Cam& cam, float dt) {
     if (ml > 1e-6f) {
         moveCharBlocked(g_char.x + mx/ml * speed, g_char.z + mz/ml * speed);
         if (sz != 0.f) { // 纯 A/D 横移不转身（strafe），W/S 才转
-            float targetYaw = atan2f(-mx/ml, -mz/ml); // 模型前方 +y 的朝向
+            float targetYaw = atan2f(-mx/ml, mz/ml); // 引擎约定：前向量=(-sin yaw, cos yaw)，0°=+Y
             float dyaw = targetYaw - g_char.yaw;
             while (dyaw > 3.14159f) dyaw -= 6.28318f;
             while (dyaw < -3.14159f) dyaw += 6.28318f;
@@ -967,19 +967,8 @@ static void updateCharAnim(App& A, float dt, bool moving) {
 static void setCharModel(App::Obj& o, const Char& ch) {
     float cy = cosf(ch.yaw), sy = sinf(ch.yaw);
     float h = terrainHeightAt(ch.x, ch.z);
-    float M[16];
-    if (o.charAnim) {
-        // 原版模型脸朝 -y：model 里先绕高度轴转 180°，让脸跟移动方向一致
-        M[0]=-cy; M[1]=-sy; M[2]=0; M[3]=0;
-        M[4]= sy; M[5]=-cy; M[6]=0; M[7]=0;
-        M[8]=0; M[9]=0; M[10]=1; M[11]=0;
-        M[12]=ch.x; M[13]=ch.z; M[14]=h; M[15]=1;
-    } else {
-        M[0]=cy; M[1]=sy; M[2]=0; M[3]=0;
-        M[4]=-sy; M[5]=cy; M[6]=0; M[7]=0;
-        M[8]=0; M[9]=0; M[10]=1; M[11]=0;
-        M[12]=ch.x; M[13]=ch.z; M[14]=h; M[15]=1;
-    }
+    // 列主序 model：先绕高度轴转 yaw，再平移（顶点已含 180° 修正）
+    float M[16] = { cy, sy, 0, 0,  -sy, cy, 0, 0,  0,0,1,0,  ch.x, ch.z, h, 1 };
     o.model.assign(M, M+16);
 }
 
