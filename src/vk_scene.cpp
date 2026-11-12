@@ -55,7 +55,9 @@ struct App {
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipeline pipeSky = VK_NULL_HANDLE;
-    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; int charPart=-1; };
+    VkPipelineLayout groundPipeLayout = VK_NULL_HANDLE;
+    VkPipeline pipeGround = VK_NULL_HANDLE;
+    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; bool ground=false; int charPart=-1; };
     std::vector<Obj> objs;
     std::vector<VkImageView> texViews;
     std::vector<std::string> texNames;
@@ -67,6 +69,9 @@ struct App {
     VkDescriptorSetLayout descLayout = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
+    VkDescriptorSetLayout groundDescLayout = VK_NULL_HANDLE;
+    VkDescriptorPool groundDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet groundDescSet = VK_NULL_HANDLE;
     uint32_t indexCount = 0;
     std::vector<float> mvp; // column-major mat4
 };
@@ -369,6 +374,9 @@ static void initVk(App& A) {
     CHECK(vkCreateCommandPool(A.dev, &cp, nullptr, &A.cmdPool), "cmdPool");
 }
 
+static std::string g_groundDiffs[3] = {"ground_turf", "ground_village", "ground_path"};
+static int g_groundLayers[3] = {2, 9, 10};
+
 static void initPipeline(App& A) {
     VK_DEV_FN(A.dev, vkCreateShaderModule); VK_DEV_FN(A.dev, vkCreatePipelineLayout); VK_DEV_FN(A.dev, vkCreateGraphicsPipelines);
     auto makeShader = [&](const char* path) {
@@ -380,6 +388,7 @@ static void initPipeline(App& A) {
     };
     VkShaderModule vs = makeShader("lit.vert.spv"), fs = makeShader("lit.frag.spv");
     VkShaderModule vsSky = makeShader("mesh.vert.spv"), fsSky = makeShader("mesh.frag.spv");
+    VkShaderModule vsG = makeShader("ground.vert.spv"), fsG = makeShader("ground.frag.spv");
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType=stages[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT; stages[0].module=vs; stages[0].pName="main";
@@ -388,6 +397,10 @@ static void initPipeline(App& A) {
     skyStages[0].sType=skyStages[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     skyStages[0].stage=VK_SHADER_STAGE_VERTEX_BIT; skyStages[0].module=vsSky; skyStages[0].pName="main";
     skyStages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT; skyStages[1].module=fsSky; skyStages[1].pName="main";
+    VkPipelineShaderStageCreateInfo groundStages[2]{};
+    groundStages[0].sType=groundStages[1].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    groundStages[0].stage=VK_SHADER_STAGE_VERTEX_BIT; groundStages[0].module=vsG; groundStages[0].pName="main";
+    groundStages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT; groundStages[1].module=fsG; groundStages[1].pName="main";
 
     VkVertexInputBindingDescription bind{}; bind.binding=0; bind.stride=44; bind.inputRate=VK_VERTEX_INPUT_RATE_VERTEX;
     VkVertexInputAttributeDescription attrs[4]{};
@@ -406,6 +419,19 @@ static void initPipeline(App& A) {
     VkPipelineVertexInputStateCreateInfo viSky{}; viSky.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     viSky.vertexBindingDescriptionCount=1; viSky.pVertexBindingDescriptions=&bind;
     viSky.vertexAttributeDescriptionCount=3; viSky.pVertexAttributeDescriptions=skyAttrs;
+    // 地面混合 shader：stride=72（18 floats：pos+权重+leveling色+法线+3 组 uv）
+    VkVertexInputBindingDescription bindG{}; bindG.binding=0; bindG.stride=72; bindG.inputRate=VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription gattrs[7]{};
+    gattrs[0].location=0; gattrs[0].binding=0; gattrs[0].format=VK_FORMAT_R32G32B32_SFLOAT; gattrs[0].offset=0;
+    gattrs[1].location=1; gattrs[1].binding=0; gattrs[1].format=VK_FORMAT_R32G32B32_SFLOAT; gattrs[1].offset=12;
+    gattrs[2].location=2; gattrs[2].binding=0; gattrs[2].format=VK_FORMAT_R32G32B32_SFLOAT; gattrs[2].offset=24;
+    gattrs[3].location=3; gattrs[3].binding=0; gattrs[3].format=VK_FORMAT_R32G32B32_SFLOAT; gattrs[3].offset=36;
+    gattrs[4].location=4; gattrs[4].binding=0; gattrs[4].format=VK_FORMAT_R32G32_SFLOAT; gattrs[4].offset=48;
+    gattrs[5].location=5; gattrs[5].binding=0; gattrs[5].format=VK_FORMAT_R32G32_SFLOAT; gattrs[5].offset=56;
+    gattrs[6].location=6; gattrs[6].binding=0; gattrs[6].format=VK_FORMAT_R32G32_SFLOAT; gattrs[6].offset=64;
+    VkPipelineVertexInputStateCreateInfo viGround{}; viGround.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    viGround.vertexBindingDescriptionCount=1; viGround.pVertexBindingDescriptions=&bindG;
+    viGround.vertexAttributeDescriptionCount=7; viGround.pVertexAttributeDescriptions=gattrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{}; ia.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -451,6 +477,38 @@ static void initPipeline(App& A) {
     }
     A.descSet = A.texSets.empty() ? VK_NULL_HANDLE : A.texSets[0];
 
+    // 地面三贴图混合 descriptor set：binding 0/1/2 = 三个 sampler2D
+    {
+        VkDescriptorSetLayoutBinding gb[3]{};
+        for (int i=0;i<3;i++) {
+            gb[i].binding=(uint32_t)i; gb[i].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            gb[i].descriptorCount=1; gb[i].stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo gdl{}; gdl.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        gdl.bindingCount=3; gdl.pBindings=gb;
+        CHECK(vkCreateDescriptorSetLayout(A.dev, &gdl, nullptr, &A.groundDescLayout), "groundDescLayout");
+        VkDescriptorPoolSize gps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3};
+        VkDescriptorPoolCreateInfo gdp{}; gdp.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        gdp.maxSets=1; gdp.poolSizeCount=1; gdp.pPoolSizes=&gps;
+        CHECK(vkCreateDescriptorPool(A.dev, &gdp, nullptr, &A.groundDescPool), "groundDescPool");
+        VkDescriptorSetAllocateInfo gda{}; gda.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        gda.descriptorPool=A.groundDescPool; gda.descriptorSetCount=1; gda.pSetLayouts=&A.groundDescLayout;
+        CHECK(vkAllocateDescriptorSets(A.dev, &gda, &A.groundDescSet), "allocGroundDescSet");
+        VkDescriptorImageInfo gdi[3]{};
+        VkWriteDescriptorSet gwd[3]{};
+        for (int i=0;i<3;i++) {
+            int slot = 0;
+            auto it = A.texIndex.find(g_groundDiffs[i]);
+            if (it != A.texIndex.end()) slot = it->second;
+            gdi[i].sampler=A.sampler; gdi[i].imageView=A.texViews[(size_t)slot];
+            gdi[i].imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            gwd[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            gwd[i].dstSet=A.groundDescSet; gwd[i].dstBinding=(uint32_t)i; gwd[i].descriptorCount=1;
+            gwd[i].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; gwd[i].pImageInfo=&gdi[i];
+        }
+        vkUpdateDescriptorSets(A.dev, 3, gwd, 0, nullptr);
+    }
+
     VkPipelineLayoutCreateInfo pl{}; pl.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pl.setLayoutCount=1; pl.pSetLayouts=&A.descLayout;
     pl.pushConstantRangeCount=1; pl.pPushConstantRanges=&pc;
@@ -465,9 +523,20 @@ static void initPipeline(App& A) {
     gpSky.pViewportState=&vsi; gpSky.pRasterizationState=&rs; gpSky.pMultisampleState=&ms; gpSky.pDepthStencilState=&dsSky;
     gpSky.pColorBlendState=&cbs; gpSky.layout=A.pipeLayout; gpSky.renderPass=A.rp; gpSky.subpass=0;
     CHECK(vkCreateGraphicsPipelines(A.dev, VK_NULL_HANDLE, 1, &gpSky, nullptr, &A.pipeSky), "skyPipeline");
+    // 地面混合 pipeline：顶点布局 stride=72，descriptor set 绑 3 张贴图
+    VkPipelineLayoutCreateInfo gpl{}; gpl.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    gpl.setLayoutCount=1; gpl.pSetLayouts=&A.groundDescLayout;
+    gpl.pushConstantRangeCount=1; gpl.pPushConstantRanges=&pc;
+    CHECK(vkCreatePipelineLayout(A.dev, &gpl, nullptr, &A.groundPipeLayout), "groundPipeLayout");
+    VkGraphicsPipelineCreateInfo gpGround{}; gpGround.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpGround.stageCount=2; gpGround.pStages=groundStages; gpGround.pVertexInputState=&viGround; gpGround.pInputAssemblyState=&ia;
+    gpGround.pViewportState=&vsi; gpGround.pRasterizationState=&rs; gpGround.pMultisampleState=&ms; gpGround.pDepthStencilState=&ds;
+    gpGround.pColorBlendState=&cbs; gpGround.layout=A.groundPipeLayout; gpGround.renderPass=A.rp; gpGround.subpass=0;
+    CHECK(vkCreateGraphicsPipelines(A.dev, VK_NULL_HANDLE, 1, &gpGround, nullptr, &A.pipeGround), "groundPipeline");
     VK_DEV_FN(A.dev, vkDestroyShaderModule);
     vkDestroyShaderModule(A.dev, vs, nullptr); vkDestroyShaderModule(A.dev, fs, nullptr);
     vkDestroyShaderModule(A.dev, vsSky, nullptr); vkDestroyShaderModule(A.dev, fsSky, nullptr);
+    vkDestroyShaderModule(A.dev, vsG, nullptr); vkDestroyShaderModule(A.dev, fsG, nullptr);
 }
 
 // 网格库：基础名 -> 该基础名下的所有网格片段（与 OpenBRF AnalyzeName 规则一致）
@@ -906,7 +975,7 @@ static void makeSceneObj(App& A, const brf::Mesh& mesh, const sco::Prop& prop, f
 }
 
 // 地面层规格：与 Data/ground_specs.txt 行序一致，index 0..10
-struct GroundSpec { std::string name, mat, diffuse; float tiling = 4.f; };
+struct GroundSpec { int index = 0; std::string name, mat, diffuse; float tiling = 4.f; };
 static std::vector<GroundSpec> loadGroundSpecs(const std::string& path) {
     std::vector<GroundSpec> v;
     std::ifstream f(path);
@@ -917,51 +986,79 @@ static std::vector<GroundSpec> loadGroundSpecs(const std::string& path) {
         GroundSpec g;
         std::string flags;
         if (!(ss >> g.name >> flags >> g.mat >> g.tiling)) continue;
+        g.index = (int)v.size();
         v.push_back(std::move(g));
     }
     if (v.size() != 11) { std::fprintf(stderr, "ground_specs 行数异常 %zu\n", v.size()); v.clear(); }
     return v;
 }
 
-// 一个 cell 的所属贴图层：非零层按 path > village > turf 优先；全 0 用 turf 兜底
-static int pickGroundLayer(const sco::Terrain& t, uint32_t i, uint32_t j) {
-    size_t idx = (size_t)j*t.width+i;
-    auto val = [&](int32_t li) -> uint8_t {
-        auto* l = t.findLayer(li);
-        return (l && idx < l->cells.size()) ? l->cells[idx] : 0;
-    };
-    if (val(10)) return 10;
-    if (val(9)) return 9;
-    if (val(2)) return 2;
-    for (int32_t li=0; li<=10; li++) if (li!=2 && li!=9 && li!=10 && val(li)) return (int)li;
-    return 2; // 全 0：turf 草地兜底
-}
-
-// 把 terrain 生成地面网格：按 ground layer 分贴图，每层一个 Obj；cell=2m，原点(0,0)
+// 地面：单网格三贴图真混合。每个 cell 的 1-3 个非零图层强度归一化成权重
+// （RGB），leveling 顶点色作 tint，3 组 uv 分别按各层 tiling 平铺。
 static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<GroundSpec>& specs,
                           float cx, float cz, std::set<std::string>& needDds) {
     uint32_t w = t.width, h = t.height;
     if (w < 2 || h < 2 || t.elevation.empty()) return;
     const float cell = 2.0f;
+    size_t blockCount = (size_t)w * h;
     auto hAt = [&](uint32_t i, uint32_t j) -> float {
         size_t idx = (size_t)j*w+i;
         return idx < t.elevation.size() ? t.elevation[idx] : 0.f;
     };
-    std::array<std::vector<float>, 11> verts;
-    std::array<std::vector<uint32_t>, 11> idxs;
-    uint64_t totalQuads = 0;
+    // 选 3 个贴图层：非零 cell 数从大到小
+    std::vector<std::pair<int,uint64_t>> ranks;
+    for (auto& l : t.layers) {
+        if (l.index < 0 || l.index > 10 || !l.enabled || l.cells.size() != blockCount) continue;
+        uint64_t nz = 0; for (uint8_t v : l.cells) if (v) nz++;
+        if (nz) ranks.push_back({l.index, nz});
+    }
+    std::sort(ranks.begin(), ranks.end(), [](auto& a, auto& b){ return a.second > b.second; });
+    for (int k=0;k<3;k++) g_groundLayers[k] = k < (int)ranks.size() ? ranks[k].first : g_groundLayers[k];
+    float tiles[3] = {4.f, 4.f, 4.f};
+    for (int k=0;k<3;k++) {
+        g_groundDiffs[k] = "ground_turf";
+        for (auto& g : specs) if (g.index == g_groundLayers[k]) {
+            if (!g.diffuse.empty()) g_groundDiffs[k] = g.diffuse;
+            tiles[k] = g.tiling;
+            break;
+        }
+        needDds.insert(g_groundDiffs[k]);
+    }
+    auto* lvl = t.findLayer(-12565);
+    const bool hasLeveling = lvl && lvl->colors.size() == blockCount;
+    std::vector<float> V; std::vector<uint32_t> I;
+    V.reserve(blockCount * 4 * 18);
+    I.reserve(blockCount * 6);
+    uint64_t mixedCells = 0;
+    auto layerVal = [&](int li, size_t idx) -> uint8_t {
+        auto* l = t.findLayer(li);
+        return (l && idx < l->cells.size()) ? l->cells[idx] : 0;
+    };
     for (uint32_t j=0;j<h-1;j++) for (uint32_t i=0;i<w-1;i++) {
-        int li = pickGroundLayer(t, i, j);
-        if (li < 0 || li > 10) li = 2;
-        auto& V = verts[li];
-        auto& I = idxs[li];
-        uint32_t base = (uint32_t)(V.size()/11);
-        // 4 角顶点（世界坐标 x=i*cell, z=j*cell；渲染坐标 y'=z, z'=-y）
+        size_t idx = (size_t)j*w+i;
+        int nz = (layerVal(g_groundLayers[0], idx)>0?1:0) + (layerVal(g_groundLayers[1], idx)>0?1:0) + (layerVal(g_groundLayers[2], idx)>0?1:0);
+        if (nz > 1) mixedCells++;
+        uint32_t base = (uint32_t)(V.size()/18);
         uint32_t cs[4][2] = {{i,j},{i+1,j},{i,j+1},{i+1,j+1}};
         for (auto& c : cs) {
+            // 权重与 leveling 颜色都是逐顶点数据（width*height），角点各取各的，跨格平滑
+            size_t cidx = (size_t)c[1]*w + c[0];
+            float s[3] = {0,0,0};
+            for (int k=0;k<3;k++) s[k] = layerVal(g_groundLayers[k], cidx);
+            float sum = s[0]+s[1]+s[2];
+            if (sum <= 0.f) { s[0] = 1.f; sum = 1.f; } // 全 0：第一层兜底（按惯例是 turf）
+            float wt[3] = {s[0]/sum, s[1]/sum, s[2]/sum};
+            float tint[3] = {1.f, 1.f, 1.f};
+            if (hasLeveling) {
+                uint32_t col = lvl->colors[cidx];
+                tint[0] = ((col >> 16) & 0xFF) / 255.0f;
+                tint[1] = ((col >> 8) & 0xFF) / 255.0f;
+                tint[2] = (col & 0xFF) / 255.0f;
+            }
             float x = c[0]*cell, z = c[1]*cell, y = hAt(c[0], c[1]);
             V.push_back(x); V.push_back(z); V.push_back(-y);
-            V.push_back(1); V.push_back(1); V.push_back(1);
+            V.push_back(wt[0]); V.push_back(wt[1]); V.push_back(wt[2]);
+            V.push_back(tint[0]); V.push_back(tint[1]); V.push_back(tint[2]);
             float lx = hAt(c[0]>0?c[0]-1:0, c[1]);
             float rx = hAt(c[0]+1<w?c[0]+1:w-1, c[1]);
             float ty = hAt(c[0], c[1]>0?c[1]-1:0);
@@ -970,37 +1067,29 @@ static void makeGroundObj(App& A, const sco::Terrain& t, const std::vector<Groun
             float fx = -dhdx, fy = -dhdz, fz = 1.0f;
             float fl = sqrtf(fx*fx+fy*fy+fz*fz); if (fl<1e-6f) fl=1;
             V.push_back(fx/fl); V.push_back(fy/fl); V.push_back(fz/fl);
-            float tile = specs.empty() || (size_t)li >= specs.size() ? 4.f : specs[li].tiling;
-            V.push_back(x/tile); V.push_back(z/tile);
+            for (int k=0;k<3;k++) { V.push_back(x/tiles[k]); V.push_back(z/tiles[k]); }
         }
         I.push_back(base); I.push_back(base+2); I.push_back(base+1);
         I.push_back(base+1); I.push_back(base+2); I.push_back(base+3);
-        totalQuads++;
     }
-    size_t made = 0;
-    for (int li=0; li<=10; li++) {
-        if (idxs[li].empty()) continue;
-        App::Obj obj;
-        std::string diff = "ground_path";
-        if ((size_t)li < specs.size() && !specs[li].diffuse.empty()) diff = specs[li].diffuse;
-        obj.diffName = diff;
-        needDds.insert(diff);
-        auto ti = A.texIndex.find(diff);
-        obj.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
-        obj.descSet = A.texSets.empty() ? VK_NULL_HANDLE : A.texSets[obj.texSlot];
-        makeBuffer(A, verts[li].size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
-        upload(A, obj.vb, obj.vm, verts[li].data(), verts[li].size()*4);
-        obj.idxCount = (uint32_t)idxs[li].size();
-        makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
-        upload(A, obj.ib, obj.im, idxs[li].data(), obj.idxCount*4);
-        float eye0[3], tgt0[3]; camFrame(cx, cz, 55.f, 0.f, -0.32f, eye0, tgt0);
+    App::Obj obj;
+    obj.ground = true;
+    obj.diffName = g_groundDiffs[0];
+    obj.descSet = A.groundDescSet; // initPipeline 之后会统一再指
+    makeBuffer(A, V.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
+    upload(A, obj.vb, obj.vm, V.data(), V.size()*4);
+    obj.idxCount = (uint32_t)I.size();
+    makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
+    upload(A, obj.ib, obj.im, I.data(), obj.idxCount*4);
+    float eye0[3], tgt0[3]; camFrame(cx, cz, 55.f, 0.f, -0.32f, eye0, tgt0);
     computeSceneMVP(obj.pc, eye0, tgt0);
-        A.objs.push_back(std::move(obj));
-        made++;
-    }
-    std::fprintf(stderr, "地面 %ux%u cell=%.0fm 总quad=%llu 分层对象=%zu 层分布:", w, h, cell, totalQuads, made);
-    for (int li=0; li<=10; li++) if (!idxs[li].empty()) std::fprintf(stderr, " L%d:%zu", li, idxs[li].size()/6);
-    std::fprintf(stderr, "\n");
+    A.objs.push_back(std::move(obj));
+    std::fprintf(stderr, "地面 %ux%u cell=%.0fm 单网格三贴图: L%d:%s L%d:%s L%d:%s 混合cell=%llu 顶点=%zu\n",
+        w, h, cell,
+        g_groundLayers[0], g_groundDiffs[0].c_str(),
+        g_groundLayers[1], g_groundDiffs[1].c_str(),
+        g_groundLayers[2], g_groundDiffs[2].c_str(),
+        (unsigned long long)mixedCells, V.size()/18);
 }
 // 简易人形占位角色：程序化 box 组成（脚在 z=0，头在 z≈1.7，前方 +y）
 static void boxPart(std::vector<float>& V, std::vector<uint32_t>& I,
@@ -1466,11 +1555,14 @@ static void recordCmdOne(App& A, size_t img) {
         vkCmdBindIndexBuffer(A.cmds[img], o.ib, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(A.cmds[img], o.idxCount, 1, 0, 0, 0);
     }
-    vkCmdBindPipeline(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipe);
     for (auto& o : A.objs) {
         if (o.sky) continue;
-        vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
-        vkCmdPushConstants(A.cmds[img], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
+        VkPipeline pipe = o.ground ? A.pipeGround : A.pipe;
+        VkPipelineLayout layout = o.ground ? A.groundPipeLayout : A.pipeLayout;
+        VkDescriptorSet desc = o.ground ? A.groundDescSet : o.descSet;
+        vkCmdBindPipeline(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &desc, 0, nullptr);
+        vkCmdPushConstants(A.cmds[img], layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
         VkDeviceSize off=0;
         vkCmdBindVertexBuffers(A.cmds[img], 0, 1, &o.vb, &off);
         vkCmdBindIndexBuffer(A.cmds[img], o.ib, 0, VK_INDEX_TYPE_UINT32);
@@ -1508,6 +1600,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "D: initPipeline\n");
     initPipeline(A);
     for (auto& o : A.objs) {
+        if (o.ground) { o.descSet = A.groundDescSet; continue; }
         auto ti = A.texIndex.find(o.diffName);
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
         o.descSet = A.texSets[o.texSlot];
@@ -1518,6 +1611,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "出生点 (%.1f,%.1f)（原中心 %.1f,%.1f）\n", g_char.x, g_char.z, sceneCX, sceneCZ);
     for (auto& o : A.objs) {
         if (!o.model.empty()) setCharModel(o, g_char);
+        if (o.ground) continue;
         auto ti = A.texIndex.find(o.diffName);
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
         o.descSet = A.texSets[o.texSlot];
