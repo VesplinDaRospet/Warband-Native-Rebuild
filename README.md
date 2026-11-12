@@ -90,7 +90,7 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 
 - [x] v0.1 static render: BRF/SCO/DDS parsing + Vulkan on screen + layered terrain texturing + directional light
 - [x] Skybox / fog / far clipping (skyboxes.brf dome + linear distance fog + zf=800)
-- [x] Character & camera controls (third-person placeholder humanoid: WASD moves the character, arrow keys orbit, QE zooms, ground-snapped)
+- [x] Character & camera controls (original `man_body` mesh + `skel_human` skeleton skinning + `man_walk` animation, CPU-skinned; WASD moves the character, arrow keys orbit, QE zooms, ground-snapped)
 - [x] Collision & pathfinding (SCO ai_mesh navmesh: 247 vertices / 422 edges / 173 faces; character constrained to walkable faces, slides along walls; G triggers A* pathfinding to the farthest walkable face)
 - [ ] Full original-scene experience
 
@@ -181,7 +181,7 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 
 - [x] v0.1 静态渲染：BRF/SCO/DDS 解析 + Vulkan 上屏 + 地形分层贴图 + 方向光
 - [x] 天空盒 / 雾 / 远裁剪（skyboxes.brf 穹顶 + 线性距离雾 + zf=800）
-- [x] 角色与相机操控（第三人称占位人形：WASD 走角色，方向键绕角色转头，QE 拉近拉远，贴地行走）
+- [x] 角色与相机操控（原版 `man_body` 模型 + `skel_human` 骨骼蒙皮 + `man_walk` 动画，CPU 蒙皮；WASD 走角色，方向键绕角色转头，QE 拉近拉远，贴地行走）
 - [x] 碰撞与寻路（SCO ai_mesh 导航网格：247 顶点/422 边/173 面；角色限走可走面、沿墙滑动；G 键 A* 自动寻路到最远可走面）
 - [ ] 完整原版场景体验
 

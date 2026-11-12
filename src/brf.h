@@ -13,6 +13,7 @@
 //   纹理: name, flags(u32)
 //   材质: name, flags, shader, diffuseA, diffuseB, bump, enviro, [可选 spec 字符串], specular f32, r,g,b f32
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -55,12 +56,43 @@ struct MaterialEntry {
     uint32_t flags = 0; float specular = 0, r = 1, g = 1, b = 1;
 };
 
+// ---------- 骨骼 / 动画（独立实现；格式事实来自公开 OpenBRF 文档与代码行为） ----------
+struct Quat { float x = 0, y = 0, z = 0, w = 1; };
+
+struct Bone {
+    std::string name;
+    int attach = -1;   // 父骨索引，-1 = 根
+    int b = 0;         // 磁盘上的第二 int（含义未用，保留）
+    Vec3 col0, col1, col2; // 3x3 旋转，列主序（已做坐标系调整）
+    Vec3 t;                // 平移（已做坐标系调整）
+    std::vector<int> children;
+};
+
+struct Skeleton {
+    std::string name;
+    int root = -1;
+    std::vector<Bone> bones;
+};
+
+struct AnimFrame {
+    int index = 0;
+    std::vector<Quat> rots; // 每骨一个，已做坐标系调整
+    Vec3 tra;               // 根位移（磁盘原值）
+};
+
+struct SkeletonAnim {
+    std::string name;
+    std::vector<AnimFrame> frames; // 按出现过的 index 重建，缺样本沿用前一帧
+};
+
 struct BrfFile {
     int version = 0; // 0 = M&B 原生文件；1 = OpenBRF rfver1；2 = 顶点格式版本2
     std::vector<Mesh> meshes;
     std::vector<TextureEntry> textures;
     std::vector<ShaderEntry> shaders;
     std::vector<MaterialEntry> materials;
+    std::vector<Skeleton> skeletons;
+    std::vector<SkeletonAnim> anims;
     std::vector<std::string> unknownTokens;
 };
 
@@ -125,30 +157,147 @@ static inline void skipBody(Reader& r) {
         }
     }
 }
-static inline void skipSkeleton(Reader& r) {
+// ---------- 骨骼坐标系调整（与公开 OpenBRF 行为一致的独立实现） ----------
+// adjust(v) = (v.z, -v.y, v.x)；用于非根骨与动画四元数
+static inline Vec3 adjustSk(Vec3 v) { return Vec3{v.z, -v.y, v.x}; }
+static inline Vec3 negV(Vec3 v) { return Vec3{-v.x, -v.y, -v.z}; }
+// 动画四元数调整：q' = (q.x, q.w, -q.z, q.y)
+static inline Quat adjustQuat(Quat q) { return Quat{q.x, q.w, -q.z, q.y}; }
+// 根骨四元数再左乘 q0=(0, s, 0, s)，s=1/sqrt(2)，标准 Hamilton 乘法
+static inline Quat quatMul(Quat a, Quat b) {
+    return Quat{
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+    };
+}
+static inline Quat adjustRootQuat(Quat q) {
+    constexpr float s = 0.7071067811865476f;
+    return quatMul(q, Quat{0.f, s, 0.f, s});
+}
+
+static inline Bone loadBone(Reader& r) {
+    Bone bn;
+    bn.attach = r.i32();
+    uint32_t probe = r.u32();
+    if (probe > 0 && probe < 99) { bn.name = r.strBody(probe); bn.b = r.i32(); }
+    // 磁盘上是 4 组 vec3，依次名为 x,z,y,t；每组内按 x,z,y 磁盘序直读，
+    // 映射回欧几里得坐标 (X=第1值, Y=第3值, Z=第2值)
+    auto rd3 = [&]() {
+        float a = r.f32(), b = r.f32(), c = r.f32();
+        return Vec3{a, c, b};
+    };
+    Vec3 px = rd3();
+    Vec3 pz = rd3();
+    Vec3 py = rd3();
+    Vec3 pt = rd3();
+    if (bn.attach >= 0) {
+        bn.col0 = adjustSk(pz);
+        bn.col1 = negV(adjustSk(py));
+        bn.col2 = adjustSk(px);
+        bn.t    = adjustSk(pt);
+    } else {
+        bn.col0 = pz;
+        bn.col1 = negV(py);
+        bn.col2 = px;
+        bn.t    = pt;
+    }
+    return bn;
+}
+
+static inline Skeleton loadSkeletonOne(Reader& r) {
+    Skeleton s;
+    s.name = r.str();
+    uint32_t n = r.u32();
+    s.bones.resize(n);
+    for (auto& b : s.bones) b = loadBone(r);
+    for (size_t i = 0; i < s.bones.size(); ++i) {
+        int a = s.bones[i].attach;
+        if (a == -1) s.root = (int)i;
+        else if (a >= 0 && (size_t)a < s.bones.size()) s.bones[a].children.push_back((int)i);
+    }
+    return s;
+}
+
+static inline void loadSkeletons(Reader& r, BrfFile& b) {
     uint32_t count = r.u32();
-    for (uint32_t i=0;i<count;i++) {
-        r.str(); // name
-        uint32_t n = r.u32();
-        for (uint32_t j=0;j<n;j++) {
-            r.i32(); // attach
-            uint32_t probe = r.u32();
-            if (probe > 0 && probe < 99) { r.skip(probe); r.i32(); }
-            r.skip(48); // 4 个 Point3f
+    b.skeletons.resize(count);
+    for (auto& s : b.skeletons) s = loadSkeletonOne(r);
+}
+
+// 重建动画帧：每骨样本 (index, quat)，缺失 index 沿用前一帧；tra 同理
+static inline void buildAnimFrames(
+    const std::vector<std::vector<std::pair<int, Quat>>>& boneSamples,
+    const std::vector<std::pair<int, Vec3>>& traSamples,
+    SkeletonAnim& out) {
+    std::vector<int> idxs;
+    for (auto& bs : boneSamples)
+        for (auto& kv : bs) idxs.push_back(kv.first);
+    for (auto& kv : traSamples) idxs.push_back(kv.first);
+    std::sort(idxs.begin(), idxs.end());
+    idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+    size_t nBones = boneSamples.size();
+    std::vector<size_t> bonePos(nBones, 0);
+    size_t traPos = 0;
+    out.frames.resize(idxs.size());
+    for (size_t f = 0; f < idxs.size(); ++f) {
+        int idx = idxs[f];
+        AnimFrame& fr = out.frames[f];
+        fr.index = idx;
+        fr.rots.resize(nBones);
+        if (f > 0) fr.rots = out.frames[f - 1].rots; // 隐式帧沿用前帧
+        for (size_t b = 0; b < nBones; ++b) {
+            auto& bs = boneSamples[b];
+            while (bonePos[b] < bs.size() && bs[bonePos[b]].first < idx) ++bonePos[b];
+            // 取最后一个 <= idx 的样本；多个同 index 取最后一个
+            size_t p = bonePos[b];
+            while (p + 1 < bs.size() && bs[p + 1].first <= idx) ++p;
+            if (p < bs.size() && bs[p].first <= idx) fr.rots[b] = bs[p].second;
+            else if (!bs.empty()) fr.rots[b] = bs[0].second; // 首样本之前兜底
         }
+        if (f > 0) fr.tra = out.frames[f - 1].tra;
+        while (traPos < traSamples.size() && traSamples[traPos].first < idx) ++traPos;
+        size_t tp = traPos;
+        while (tp + 1 < traSamples.size() && traSamples[tp + 1].first <= idx) ++tp;
+        if (tp < traSamples.size() && traSamples[tp].first <= idx) fr.tra = traSamples[tp].second;
+        else if (!traSamples.empty()) fr.tra = traSamples[0].second;
     }
 }
-static inline void skipAnimation(Reader& r) {
-    uint32_t count = r.u32();
-    for (uint32_t i=0;i<count;i++) {
-        r.str(); // name
-        uint32_t nBones = r.u32();
-        for (uint32_t j=0;j<nBones;j++) {
-            uint32_t c = r.u32(); r.skip((size_t)c*20); // TmpCas4 = i32 + Point4f
+
+static inline SkeletonAnim loadSkeletonAnimOne(Reader& r) {
+    SkeletonAnim a;
+    a.name = r.str();
+    uint32_t nBones = r.u32();
+    std::vector<std::vector<std::pair<int, Quat>>> boneSamples(nBones);
+    for (uint32_t i = 0; i < nBones; ++i) {
+        uint32_t c = r.u32();
+        boneSamples[i].resize(c);
+        for (uint32_t j = 0; j < c; ++j) {
+            int idx = r.i32();
+            // Point4f 磁盘序 Y,W,Z,X → 四元数 (X,Y,Z,W)
+            float yv = r.f32(), wv = r.f32(), zv = r.f32(), xv = r.f32();
+            Quat q{xv, yv, zv, wv};
+            q = adjustQuat(q);
+            if (i == 0) q = adjustRootQuat(q);
+            boneSamples[i][j] = {idx, q};
         }
-        uint32_t nTrans = r.u32();
-        r.skip((size_t)nTrans*16); // TmpCas3 = i32 + Point3f
     }
+    uint32_t nTrans = r.u32();
+    std::vector<std::pair<int, Vec3>> traSamples(nTrans);
+    for (uint32_t j = 0; j < nTrans; ++j) {
+        int idx = r.i32();
+        float a = r.f32(), b = r.f32(), c = r.f32();
+        traSamples[j] = {idx, Vec3{a, c, b}}; // 磁盘序 x,z,y
+    }
+    buildAnimFrames(boneSamples, traSamples, a);
+    return a;
+}
+
+static inline void loadSkeletonAnims(Reader& r, BrfFile& b) {
+    uint32_t count = r.u32();
+    b.anims.resize(count);
+    for (auto& a : b.anims) a = loadSkeletonAnimOne(r);
 }
 
 // 解析一个对象向量（元素自带 Load 语义）
@@ -237,9 +386,9 @@ inline BrfFile parse(const std::string& path, bool verbose = false) {
                 for (uint32_t i = 0; i < nFace * 3; ++i) m.indices[i] = (uint32_t)r.i32();
             }
         } else if (token == "skeleton") {
-            skipSkeleton(r);
+            loadSkeletons(r, b);
         } else if (token == "skeleton_anim") {
-            skipAnimation(r);
+            loadSkeletonAnims(r, b);
         } else if (token == "body") {
             skipBody(r);
         } else {

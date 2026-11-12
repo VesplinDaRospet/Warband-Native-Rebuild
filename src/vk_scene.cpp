@@ -7,6 +7,7 @@
 #include "brf.h"
 #include "dds.h"
 #include "sco.h"
+#include "skin.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -53,7 +54,7 @@ struct App {
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkPipeline pipeSky = VK_NULL_HANDLE;
-    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; };
+    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; };
     std::vector<Obj> objs;
     std::vector<VkImageView> texViews;
     std::vector<std::string> texNames;
@@ -475,6 +476,19 @@ static sco::Terrain g_terrain;
 struct Char { float x=0, z=0, yaw=0.f; };
 static Char g_char;
 static sco::AiMesh g_aiMesh;
+// 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf）
+struct CharSkin {
+    bool ok = false;
+    brf::BrfFile skelFile, animFile, bodyFile;
+    brf::Skeleton* skel = nullptr;
+    brf::SkeletonAnim* anim = nullptr;
+    brf::Mesh* body = nullptr;
+    std::vector<skin::M44> bind;
+    float t = 0.f;
+    size_t frame = 0;
+    std::string diffuse = "snow";
+};
+static CharSkin g_charSkin;
 static int32_t g_lastFace = -1;
 static std::vector<int32_t> g_path; static size_t g_pathIdx = 0; static bool g_wasG = false;
 
@@ -818,7 +832,65 @@ static void boxPart(std::vector<float>& V, std::vector<uint32_t>& I,
         I.push_back(b0); I.push_back(b0+3); I.push_back(b0+2);
     }
 }
-static void makeCharObj(App& A) {
+// ---------- 原版角色：skeleton + skinning（CPU 蒙皮，walk 循环动画） ----------
+static void loadCharSkin(const std::string& commonRes) {
+    if (g_charSkin.ok) return;
+    try {
+        g_charSkin.skelFile = brf::parse(commonRes + "/skeletons.brf");
+        g_charSkin.animFile = brf::parse(commonRes + "/ani_man_walk.brf");
+        g_charSkin.bodyFile = brf::parse(commonRes + "/body_meshes.brf");
+        for (auto& s : g_charSkin.skelFile.skeletons) if (s.name == "skel_human") { g_charSkin.skel = &s; break; }
+        for (auto& a : g_charSkin.animFile.anims) if (a.name == "man_walk") { g_charSkin.anim = &a; break; }
+        for (auto& m : g_charSkin.bodyFile.meshes) if (m.name == "man_body") { g_charSkin.body = &m; break; }
+        if (!g_charSkin.skel || !g_charSkin.anim || !g_charSkin.body) {
+            std::fprintf(stderr, "原版角色资源不完整（skel/anim/body），回退占位 box 人\n");
+            g_charSkin.ok = false;
+            return;
+        }
+        skin::bindGlobals(*g_charSkin.skel, g_charSkin.bind);
+        auto dit = g_materialDiffuse.find(g_charSkin.body->material);
+        if (dit != g_materialDiffuse.end() && !dit->second.empty() && dit->second != "none")
+            g_charSkin.diffuse = dit->second;
+        g_charSkin.ok = true;
+        std::fprintf(stderr, "原版角色: %s(%zu骨) + %s(%zu帧) + %s(%zu顶点/%u三角形) 贴图=%s\n",
+            g_charSkin.skel->name.c_str(), g_charSkin.skel->bones.size(),
+            g_charSkin.anim->name.c_str(), g_charSkin.anim->frames.size(),
+            g_charSkin.body->name.c_str(), g_charSkin.body->positions.size(),
+            (uint32_t)(g_charSkin.body->indices.size()/3), g_charSkin.diffuse.c_str());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "原版角色加载失败: %s，回退占位 box 人\n", e.what());
+        g_charSkin.ok = false;
+    }
+}
+
+// 蒙皮一帧，生成 11-float 渲染顶点（角色本地：前方 +y，脚底 z≈0）
+static void buildCharVerts(std::vector<float>& V) {
+    V.clear();
+    const brf::Mesh& m = *g_charSkin.body;
+    std::vector<skin::M44> ag, skm;
+    const brf::AnimFrame& fr = g_charSkin.anim->frames[g_charSkin.frame % g_charSkin.anim->frames.size()];
+    skin::animGlobals(*g_charSkin.skel, fr, ag);
+    skin::skinMatrices(g_charSkin.bind, ag, skm);
+    std::vector<brf::Vec3> op, on;
+    skin::skinMesh(m, skm, op, on);
+    float minZ = 1e9f;
+    for (size_t i = 0; i < m.verts.size(); i++) {
+        int idx = m.verts[i].index;
+        if (idx < 0 || (size_t)idx >= op.size()) continue;
+        // OpenBRF -> 角色本地渲染坐标：ob=(x,y,z) -> render=(z,x,y)，再绕高度轴 -90° 使前方(-x)转到 +y
+        brf::Vec3 p = op[idx], n = on[i];
+        brf::Vec3 rp{p.x, -p.z, p.y}, rn{n.x, -n.z, n.y};
+        minZ = std::min(minZ, rp.z);
+        V.push_back(rp.x); V.push_back(rp.y); V.push_back(rp.z);
+        uint32_t c = m.verts[i].color;
+        V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
+        V.push_back(rn.x); V.push_back(rn.y); V.push_back(rn.z);
+        V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
+    }
+    for (size_t i = 0; i < V.size(); i += 11) V[i+2] -= minZ; // 脚底贴地
+}
+
+static void makeBoxCharObj(App& A) {
     std::vector<float> V; std::vector<uint32_t> I;
     boxPart(V,I, -0.16f,0.16f, -0.12f,0.12f, 0.0f,0.72f, 0.30f,0.22f,0.12f); // 左腿? 用一对
     boxPart(V,I, -0.16f,0.16f, -0.12f,0.12f, 0.0f,0.72f, 0.30f,0.22f,0.12f);
@@ -839,6 +911,38 @@ static void makeCharObj(App& A) {
     upload(A, obj.ib, obj.im, I.data(), obj.idxCount*4);
     A.objs.push_back(std::move(obj));
     std::fprintf(stderr, "占位角色 顶点=%zu 三角形=%zu\n", V.size()/11, I.size()/3);
+}
+static void makeCharObj(App& A, std::set<std::string>& needDds) {
+    if (!g_charSkin.ok) { makeBoxCharObj(A); return; }
+    std::vector<float> V;
+    buildCharVerts(V);
+    App::Obj obj;
+    obj.diffName = g_charSkin.diffuse;
+    needDds.insert(obj.diffName);
+    obj.charAnim = true;
+    obj.model.assign(16, 0.f);
+    makeBuffer(A, V.size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
+    upload(A, obj.vb, obj.vm, V.data(), V.size()*4);
+    obj.idxCount = (uint32_t)g_charSkin.body->indices.size();
+    makeBuffer(A, obj.idxCount*4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, obj.ib, obj.im);
+    upload(A, obj.ib, obj.im, g_charSkin.body->indices.data(), obj.idxCount*4);
+    A.objs.push_back(std::move(obj));
+    float mnx=1e9f,mny=1e9f,mnz=1e9f,mxx=-1e9f,mxy=-1e9f,mxz=-1e9f;
+    for (size_t i=0;i+2<V.size();i+=11){mnx=std::min(mnx,V[i]);mxx=std::max(mxx,V[i]);mny=std::min(mny,V[i+1]);mxy=std::max(mxy,V[i+1]);mnz=std::min(mnz,V[i+2]);mxz=std::max(mxz,V[i+2]);}
+    std::fprintf(stderr, "原版角色已上屏 顶点=%zu 三角形=%u bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
+        V.size()/11, (uint32_t)(g_charSkin.body->indices.size()/3), mnx,mxx,mny,mxy,mnz,mxz);
+}
+static void updateCharAnim(App& A, float dt, bool moving) {
+    if (!g_charSkin.ok) return;
+    if (moving) g_charSkin.t += dt * 30.f * (GetAsyncKeyState(VK_SHIFT) & 0x8000 ? 1.8f : 1.f);
+    else g_charSkin.t = 0.f;
+    g_charSkin.frame = (size_t)g_charSkin.t;
+    std::vector<float> V;
+    buildCharVerts(V);
+    for (auto& o : A.objs) {
+        if (!o.charAnim) continue;
+        upload(A, o.vb, o.vm, V.data(), V.size()*4);
+    }
 }
 static void setCharModel(App::Obj& o, const Char& ch) {
     float cy = cosf(ch.yaw), sy = sinf(ch.yaw);
@@ -1062,6 +1166,8 @@ int main(int argc, char** argv) {
     std::set<std::string> needDds;
     std::fprintf(stderr, "E: 装配场景物件\n");
     loadSceneAssets(A, argv[1], argv[2], argv[3], sceneCX, sceneCZ, needDds);
+    loadCharSkin(argv[3]);
+    makeCharObj(A, needDds);
     std::vector<std::string> ddsNames(needDds.begin(), needDds.end());
     if (ddsNames.empty()) ddsNames.push_back("shields");
     std::fprintf(stderr, "C2: 加载 %zu 张贴图\n", ddsNames.size());
@@ -1076,7 +1182,6 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "F: allocCmds\n");
     allocCmds(A);
     g_char.x = sceneCX; g_char.z = sceneCZ;
-    makeCharObj(A);
     for (auto& o : A.objs) {
         if (!o.model.empty()) setCharModel(o, g_char);
         auto ti = A.texIndex.find(o.diffName);
@@ -1084,6 +1189,7 @@ int main(int argc, char** argv) {
         o.descSet = A.texSets[o.texSlot];
     }
     Cam cam; // 第三人称相机：初始在角色北侧
+    cam.dist = 10.f; cam.height = 8.f; // 初始拉高一点，避免被近处建筑挡住角色
     float eye[3], tgt[3];
     playerFrame(g_char, cam, eye, tgt);
     updateAllMVP(A, eye, tgt);
@@ -1125,7 +1231,8 @@ int main(int argc, char** argv) {
         // 等该 image 上一次的提交完成，再安全重录
         vkWaitForFences(A.dev, 1, &A.fences[img], VK_TRUE, UINT64_MAX);
         vkResetFences(A.dev, 1, &A.fences[img]);
-        updatePlayer(cam, dt);
+        bool moving = updatePlayer(cam, dt);
+        updateCharAnim(A, dt, moving);
         for (auto& o : A.objs) if (!o.model.empty()) setCharModel(o, g_char);
         playerFrame(g_char, cam, eye, tgt);
         updateAllMVP(A, eye, tgt);
