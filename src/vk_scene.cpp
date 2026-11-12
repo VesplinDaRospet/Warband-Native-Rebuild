@@ -153,8 +153,10 @@ static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const fl
     pc[20] = 70.f; pc[21] = 300.f;    // 雾起点/终点（世界距离）
 }
 
+static POINT g_click{-1,-1};   // 战斗模式：左键 = 攻击
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_CLOSE || (msg == WM_KEYDOWN && w == VK_ESCAPE)) PostQuitMessage(0);
+    if (msg == WM_LBUTTONDOWN) { g_click.x = (short)(l & 0xFFFF); g_click.y = (short)((l >> 16) & 0xFFFF); }
     return DefWindowProcA(h, msg, w, l);
 }
 
@@ -560,9 +562,15 @@ static void initPipeline(App& A) {
 static std::map<std::string, std::vector<brf::Mesh>> g_meshGroups;
 static std::map<std::string, std::string> g_materialDiffuse;
 static sco::Terrain g_terrain;
-struct Char { float x=0, z=0, yaw=0.f; };
+struct Char { float x=0, z=0, yaw=0.f; float hp=8.f, atkCd=0.f; bool alive=true; };
 static Char g_char;
 static std::vector<Char> g_chars;   // 战斗模式：g_chars[0]=玩家，后面是敌方 troops
+static float g_atkCd = 0.f;         // 玩家攻击冷却
+static float g_endTimer = -1.f;     // 战斗结束后停留倒计时，-1=未结束
+static std::string g_endResult;     // "胜" / "败"
+static std::string g_battleName = "野队";  // 遭遇的野队名，回地图时带回
+static std::vector<float> g_hitFlash;      // 每组受击闪红计时
+static bool g_battleFast() { static bool v = getenv("VK_BATTLE_FAST") != nullptr; return v; } // 速测：1 血敌方+血厚玩家
 static sco::AiMesh g_aiMesh;
 // 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf / meshes_face_gen.brf）
 struct CharSkin {
@@ -692,6 +700,20 @@ static bool freeAt(float x, float z) {
     return blockedByProps(x, z, foot, foot + 1.9f) == nullptr;
 }
 static float clampToTerrain(float v, bool xAxis) {
+    if (g_aiMesh.ok) { // 以导航网格真实范围为准（场地图地形网格可能只是局部）
+        static float mx0 = 1e9f, mx1 = -1e9f, mz0 = 1e9f, mz1 = -1e9f; static bool done = false;
+        if (!done) {
+            for (size_t i = 0; i < g_aiMesh.faces.size(); i++)
+                for (uint32_t vi : g_aiMesh.faces[i].verts) {
+                    if (vi >= g_aiMesh.vertX.size()) continue;
+                    mx0 = std::min(mx0, g_aiMesh.vertX[vi]); mx1 = std::max(mx1, g_aiMesh.vertX[vi]);
+                    mz0 = std::min(mz0, g_aiMesh.vertY[vi]); mz1 = std::max(mz1, g_aiMesh.vertY[vi]);
+                }
+            done = true;
+        }
+        float lo = xAxis ? mx0 : mz0, hi = xAxis ? mx1 : mz1;
+        if (hi > lo) return std::max(lo + 0.5f, std::min(v, hi - 0.5f));
+    }
     if (g_terrain.width < 2 || g_terrain.height < 2) return v;
     float lim = xAxis ? g_terrain.width*2.0f : g_terrain.height*2.0f;
     return std::max(0.f, std::min(v, lim));
@@ -1395,12 +1417,16 @@ static void updateCharAnim(App& A, float dt, bool moving) {
     buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     for (auto& o : A.objs) {
         if (!o.charAnim || o.charPart < 0 || (size_t)o.charPart >= V.size()) continue;
-        if (o.tintR == 1.f && o.tintG == 1.f && o.tintB == 1.f) {
+        float tr = o.tintR, tg = o.tintG, tb = o.tintB;
+        if (o.charGroup > 0 && (size_t)o.charGroup < g_hitFlash.size() && g_hitFlash[(size_t)o.charGroup] > 0.f) {
+            tr = 1.f; tg = 0.12f; tb = 0.12f; // 受击闪红
+        }
+        if (tr == 1.f && tg == 1.f && tb == 1.f) {
             upload(A, o.vb, o.vm, V[o.charPart].data(), V[o.charPart].size()*4);
         } else {
             std::vector<float> tv = V[o.charPart]; // 敌方染色副本（每队各自独立缓冲）
             for (size_t i = 3; i + 7 < tv.size(); i += 11) {
-                tv[i] *= o.tintR; tv[i+1] *= o.tintG; tv[i+2] *= o.tintB;
+                tv[i] *= tr; tv[i+1] *= tg; tv[i+2] *= tb;
             }
             upload(A, o.vb, o.vm, tv.data(), tv.size()*4);
         }
@@ -1657,6 +1683,7 @@ static void recordCmdOne(App& A, size_t img) {
     }
     for (auto& o : A.objs) {
         if (o.sky) continue;
+        if (o.charGroup > 0 && (size_t)o.charGroup < g_chars.size() && !g_chars[(size_t)o.charGroup].alive) continue; // 已击倒的敌方不画
         VkPipeline pipe = o.ground ? A.pipeGround : A.pipe;
         VkPipelineLayout layout = o.ground ? A.groundPipeLayout : A.pipeLayout;
         VkDescriptorSet desc = o.ground ? A.groundDescSet : o.descSet;
@@ -1701,6 +1728,7 @@ int main(int argc, char** argv) {
     if (argc < a0 + 4) { std::printf("参数不足\n"); return 1; }
     int enemyCount = 0;
     if (battle) enemyCount = (argc >= a0 + 8) ? atoi(argv[a0 + 7]) : 4;
+    if (battle && argc >= a0 + 11) g_battleName = argv[a0 + 10]; // 遭遇的野队名（回地图结算用）
     std::string mapReturnArgs;
     if (battle) {
         if (argc >= a0 + 6) mapReturnArgs = "\"" + std::string(argv[a0+4]) + "\" \"" + std::string(argv[a0+5]) + "\"";
@@ -1751,14 +1779,18 @@ int main(int argc, char** argv) {
     safeSpawn(sceneCX, sceneCZ);
     if (battle) {
         g_chars[0] = g_char; // 玩家
+        g_chars[0].hp = g_battleFast() ? 999.f : 8.f;
         for (size_t e = 1; e < g_chars.size(); e++) {
             float offX = -10.f + (float)(e - 1) * 4.f;              // 横向排开一列，正对镜头，避开与玩家重叠
             float offZ = 0.f;
             spawnNear(g_chars[e], g_char.x + offX, g_char.z + offZ);
             float dx = g_char.x - g_chars[e].x, dz = g_char.z - g_chars[e].z;
             g_chars[e].yaw = atan2f(-dx, dz); // 面向玩家（引擎朝向约定）
+            g_chars[e].hp = g_battleFast() ? 1.f : 4.f;
+            g_chars[e].atkCd = 1.5f + (float)(e % 3) * 0.5f;
         }
-        std::fprintf(stderr, "战斗：玩家 1 + 敌方 %d，场景布局用模组作者自己的\n", enemyCount);
+        g_hitFlash.assign(g_chars.size(), 0.f);
+        std::fprintf(stderr, "战斗：玩家 1 + 敌方 %d，场景布局用模组作者自己的%s\n", enemyCount, g_battleFast() ? "（速测模式）" : "");
     }
     std::fprintf(stderr, "出生点 (%.1f,%.1f)（原中心 %.1f,%.1f）\n", g_char.x, g_char.z, sceneCX, sceneCZ);
     for (auto& o : A.objs) {
@@ -1814,18 +1846,85 @@ int main(int argc, char** argv) {
         vkResetFences(A.dev, 1, &A.fences[img]);
         bool moving = updatePlayer(cam, dt);
         if (battle && !g_chars.empty()) {
-            g_chars[0] = g_char; // 玩家位姿同步给 charGroup 0
-            for (size_t e = 1; e < g_chars.size(); e++) { // v0.6-1：敌方列阵面向玩家，不移动（机制下一版）
+            g_chars[0].x = g_char.x; g_chars[0].z = g_char.z; g_chars[0].yaw = g_char.yaw;
+            if (g_atkCd > 0.f) g_atkCd -= dt;
+            for (size_t e = 1; e < g_chars.size(); e++) {
                 Char& c = g_chars[e];
+                if (!c.alive) continue;
                 float dx = g_char.x - c.x, dz = g_char.z - c.z;
+                float dist = sqrtf(dx*dx + dz*dz);
                 c.yaw = atan2f(-dx, dz);
+                if (dist > 1.2f) {          // 压上玩家
+                    float step = std::min(1.1f*dt, dist - 1.2f);
+                    moveCharBlockedC(c, c.x + dx/dist*step, c.z + dz/dist*step);
+                } else if (g_endTimer < 0.f && c.atkCd <= 0.f) { // 近身攻击玩家（战斗结束即停手）
+                    c.atkCd = 2.0f;
+                    g_chars[0].hp -= 1.f;
+                    std::fprintf(stderr, "[被击] 玩家 HP %.0f\n", g_chars[0].hp);
+                }
+                if (c.atkCd > 0.f) c.atkCd -= dt;
+                if (g_hitFlash[e] > 0.f) g_hitFlash[e] -= dt;
+            }
+            // 玩家攻击：鼠标左键 → 面前 2.2 米、60° 扇区内的最近敌人
+            if (g_click.x >= 0) {
+                g_click.x = -1; g_click.y = -1;
+                if (g_atkCd <= 0.f) {
+                    g_atkCd = 0.5f;
+                    float fx = -sinf(g_char.yaw), fz = cosf(g_char.yaw);
+                    int best = -1; float bestA = 1e9f;
+                    for (size_t e = 1; e < g_chars.size(); e++) {
+                        if (!g_chars[e].alive) continue;
+                        float ex = g_chars[e].x - g_char.x, ez = g_chars[e].z - g_char.z;
+                        float d = sqrtf(ex*ex + ez*ez);
+                        if (d > 2.6f) continue;
+                        float dot = (ex*fx + ez*fz) / d;
+                        if (dot < -0.2f) continue; // 约 101° 扇区，两侧近身的也能砍到
+                        float ang = acosf(std::min(1.f, std::max(-1.f, dot)));
+                        if (ang < bestA) { bestA = ang; best = (int)e; }
+                    }
+                    if (best > 0) {
+                        g_chars[(size_t)best].hp -= 2.f;
+                        g_hitFlash[(size_t)best] = 0.25f;
+                        std::fprintf(stderr, "[击中] %s 组%d 剩 HP %.0f\n", g_battleName.c_str(), best, g_chars[(size_t)best].hp);
+                        if (g_chars[(size_t)best].hp <= 0.f) {
+                            g_chars[(size_t)best].alive = false;
+                            std::fprintf(stderr, "[击倒] %s 组%d\n", g_battleName.c_str(), best);
+                        }
+                    } else {
+                        std::fprintf(stderr, "[挥空]\n");
+                    }
+                }
+            }
+            // 结束判定 → 1.6 秒后回大地图结算
+            if (g_endTimer < 0.f) {
+                bool allDead = true;
+                for (size_t e = 1; e < g_chars.size(); e++) if (g_chars[e].alive) { allDead = false; break; }
+                if (g_chars[0].hp <= 0.f) { g_endResult = "lose"; g_endTimer = 1.6f; std::fprintf(stderr, "[战败] 返回大地图\n"); }
+                else if (allDead)        { g_endResult = "win";  g_endTimer = 1.6f; std::fprintf(stderr, "[胜利] 返回大地图\n"); }
+            } else {
+                g_endTimer -= dt;
+                if (g_endTimer <= 0.f && !mapReturnArgs.empty()) {
+                    sceneLaunchAndExit("vk_map.exe", mapReturnArgs + " \"" + g_endResult + "\" \"" + g_battleName + "\"");
+                }
             }
         }
         if (!mapReturnArgs.empty() && (GetAsyncKeyState('M') & 0x8000)) {
             std::fprintf(stderr, "M 返回大地图\n");
             sceneLaunchAndExit("vk_map.exe", mapReturnArgs);
         }
-        if (!g_lastHit.empty()) {
+        if (battle) {
+            static int lastAlive = -1; static float lastHp = -1.f; static std::string lastRes;
+            int alive = 0;
+            for (size_t e = 1; e < g_chars.size(); e++) if (g_chars[e].alive) alive++;
+            if (alive != lastAlive || g_chars[0].hp != lastHp || g_endResult != lastRes) {
+                char t[200];
+                std::snprintf(t, sizeof(t), "CV War Battle | HP %.0f | Enemies %d%s | LMB=attack",
+                              g_chars[0].hp, alive,
+                              g_endResult.empty() ? "" : (g_endResult == "win" ? " | VICTORY" : " | DEFEAT"));
+                SetWindowTextA(A.hwnd, t);
+                lastAlive = alive; lastHp = g_chars[0].hp; lastRes = g_endResult;
+            }
+        } else if (!g_lastHit.empty()) {
             std::string title = "M&B 原生场景渲染 | 撞到: " + g_lastHit;
             SetWindowTextA(A.hwnd, title.c_str());
         }

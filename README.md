@@ -44,6 +44,10 @@ vk_map "<module>\map.txt" "<game root>\Textures"
 
 Game files such as `map.txt` and `.dds` textures are **not** distributed with this repository; point the tool at your own game installation.
 
+### Battle scene / 战斗场景
+
+Touching an AI party on the map enters a battle scene from the module's own scene files (`vk_scene --battle`). The player and several enemy troops are rendered as separate character groups (enemies tinted red); enemies close in and strike back, and **left mouse click** attacks the nearest enemy inside a 2.6 m / ~100° hit cone. HP is tracked for both sides; when all enemies fall you win, when the player's HP reaches zero you lose, and either way the campaign map is relaunched with the result (and a defeated party disappears from the map).
+
 ### Layout
 
 - `src/`
@@ -113,7 +117,9 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 - [x] v0.3 campaign map: `map.txt` renderer with terrain-coded texturing and click-to-move BFS pathfinding
 - [x] v0.4 map↔scene loop: settlement icons from `map_icons.txt`/`parties.txt`, click to enter the matching `.sco` scene, `M` returns to the map
 - [x] v0.5 map party system: real-time player party movement, camera follow, game-time/pause HUD, AI patrol parties, encounter trigger, minimum-screen-size party/settlement badges
-- [ ] Next: encounters/battle scenes or scene interaction (entries/doors), then the gameplay-logic rewrite
+- [x] v0.6-1 battle scene rendering: player + enemy troops in a module battle scene (`vk_scene --battle`), auto-entered from map encounters
+- [x] v0.6-2 basic combat mechanics: left-click attack with hit cone, enemies close in and strike back, HP tracking, deaths, win/lose returns to the campaign map with the result
+- [ ] Next: troop equipment/visuals from module data, then scene interaction (entries/doors) or the gameplay-logic rewrite
 
 ### License
 
@@ -156,6 +162,10 @@ vk_map "<模组目录>\map.txt" "<游戏根目录>\Textures"
 ```
 
 `map.txt`、`.dds` 等游戏文件**不随本仓库分发**，请把工具指向你自己的游戏安装。
+
+## 战斗场景 / Battle scene
+
+地图上撞到 AI 野队会进入模组自带场景文件的战斗场景（`vk_scene --battle`）。玩家与多名敌方 troops 按独立角色组渲染（敌方偏红染色）；敌方会逼近并反击，**鼠标左键**攻击 2.6 米 / 约 100° 扇区内最近的敌人。双方都有血量：敌方全灭 = 胜，玩家血量归零 = 败，结束后自动回到大地图并显示结算（被消灭的野队从地图上消失）。
 
 ## 目录
 
@@ -225,7 +235,9 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 - [x] v0.3 战役大地图：`map.txt` 渲染（按地形码贴图）+ 点击寻路（BFS）
 - [x] v0.4 地图↔场景闭环：`map_icons.txt`/`parties.txt` 定居点图标，点击进入对应 `.sco` 场景，按 `M` 回地图
 - [x] v0.5 地图队伍系统：玩家队伍实时行军、镜头跟随、游戏时间/暂停 HUD、AI 野队巡逻、遭遇触发、队伍/定居点最小屏占比图标
-- [ ] 下一步：遭遇/战斗场景，或场景交互（出入口/门），之后是玩法逻辑重写
+- [x] v0.6-1 战斗场景渲染：玩家 + 敌方 troops 进入模组战斗场景（`vk_scene --battle`），地图遭遇后自动进入
+- [x] v0.6-2 基础战斗机制：左键攻击（扇区判定）、敌方逼近反击、血量、倒地、胜负回大地图并结算
+- [ ] 下一步：troops 装备/外观按模组数据装配，之后是场景交互（出入口/门）或玩法逻辑重写
 
 ## 许可证
 

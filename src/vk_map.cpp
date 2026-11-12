@@ -803,6 +803,7 @@ struct MapParty {
     size_t wayIdx = 0;
     bool isPlayer = false;
     bool hold = false;   // 遭遇中停在原地
+    bool dead = false;   // 战斗中已被消灭（不显示不巡逻）
 };
 
 static std::vector<std::array<float,2>> g_way;
@@ -814,6 +815,8 @@ static std::string g_encounter;
 static std::string g_encounterPrev;
 static float g_battleTimer = 0.f;      // 遭遇后停留 1.5 秒自动进战斗
 static bool g_battleLaunched = false;
+static std::string g_battleResult;     // 战斗结算："胜"/"败"（vk_scene 回传）
+static std::string g_deadParty;        // 被消灭的野队名
 static float g_hour = 6.f;      // 游戏时间：第 g_day 天 g_hour 时
 static int g_day = 1;
 
@@ -1076,6 +1079,10 @@ int main(int argc, char** argv) {
         g_mx = p.x; g_my = p.y; playerIcon = p.icon; break;
     }
     if (argc >= 5) { g_mx = (float)atof(argv[3]); g_my = (float)atof(argv[4]); }
+    if (argc >= 7) { // 战斗结算回传（ASCII：win/lose + 野队名）
+        g_battleResult = (std::string(argv[5]) == "win") ? "胜" : (std::string(argv[5]) == "lose" ? "败" : std::string(argv[5]));
+        g_deadParty = argv[6];
+    }
     if (!posWalkable(md, g_mx, g_my)) {
         int f = nearestWalkableFace(md, g_mx, g_my);
         mapFaceCenter(md, f, g_mx, g_my);
@@ -1122,6 +1129,14 @@ int main(int argc, char** argv) {
                                         icons[(size_t)ap.icon].scale, ap.x, ap.y, 3.f, mapObjs);
             else ap.objIdx = (size_t)-1;
             ap.badgeIdx = makeBadgeObj(A, whiteDesc, 1.f, 0.12f, 0.12f, 2.2f, ap.x, ap.y, 15.f, mapObjs);
+            if (!g_deadParty.empty() && ap.name == g_deadParty) {
+                ap.dead = true;
+                std::fprintf(stderr, "[结算] %s 已被消灭\n", ap.name.c_str());
+            }
+            if (ap.dead) { // 被消灭的野队不显示
+                if (ap.objIdx != (size_t)-1) mapObjs[ap.objIdx].model[14] = -999.f;
+                if (ap.badgeIdx != (size_t)-1) mapObjs[ap.badgeIdx].model[14] = -999.f;
+            }
             ai.push_back(std::move(ap));
         }
     }
@@ -1177,8 +1192,9 @@ int main(int argc, char** argv) {
             gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
             std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
             gameRoot + "\\Textures\"";
-        char tail[96];
-        std::snprintf(tail, sizeof(tail), " 5 %.2f %.2f", g_mx, g_my);
+        char tail[160];
+        const char* nm = g_encounter.empty() ? "野队" : g_encounter.c_str();
+        std::snprintf(tail, sizeof(tail), " 5 %.2f %.2f \"%s\"", g_mx, g_my, nm);
         argline += tail;
         std::fprintf(stderr, "[战斗] 进入 %s（CV War 作者布局，敌方 5 人）\n", sco.c_str());
         launchAndExit("vk_scene.exe", argline);
@@ -1299,7 +1315,7 @@ int main(int argc, char** argv) {
 
         // AI 野队巡逻：围绕出生点随机选可走面，BFS 行走
         if (simDt > 0.f) for (auto& ap : ai) {
-            if (ap.hold) continue;
+            if (ap.hold || ap.dead) continue;
             if (ap.wayIdx < ap.way.size()) stepAiParty(ap, ap.speed*simDt);
             else { ap.wait -= simDt; if (ap.wait <= 0.f) chooseAiPath(md, ap, 30.f); }
             if (ap.objIdx != (size_t)-1) setIconModel(mapObjs[ap.objIdx], ap.x, ap.y, 3.f,
@@ -1312,6 +1328,7 @@ int main(int argc, char** argv) {
         if (simDt > 0.f) {
         g_encounter.clear();
         for (auto& ap : ai) {
+            if (ap.dead) continue;
             float dx = ap.x - g_mx, dy = ap.y - g_my;
             float d2 = dx*dx + dy*dy;
             if (d2 < 1.44f) {
@@ -1351,11 +1368,12 @@ int main(int argc, char** argv) {
         int hour = (int)g_hour;
         if (hour != lastHour || g_day != lastDay || g_paused != lastPaused || g_encounter != lastEnc) {
             std::string enc = g_encounter.empty() ? "" : " | 遭遇:" + g_encounter;
-            char title[320];
+            std::string res = g_battleResult.empty() ? "" : (" | 战斗" + g_battleResult + (g_deadParty.empty() ? "" : ":" + g_deadParty));
+            char title[380];
             std::snprintf(title, sizeof(title),
-                "CV War 大地图 | 第%d天 %02d:00 | 队伍(%.0f,%.0f)%s%s | WASD行军 Shift加速 点击寻路/进城 空格暂停 QE缩放 方向键视角 ESC退出",
+                "CV War 大地图 | 第%d天 %02d:00 | 队伍(%.0f,%.0f)%s%s%s | WASD行军 Shift加速 点击寻路/进城 空格暂停 QE缩放 方向键视角 ESC退出",
                 g_day, hour, g_mx, g_my,
-                g_paused ? " | 已暂停" : "", enc.c_str());
+                g_paused ? " | 已暂停" : "", enc.c_str(), res.c_str());
             setTitleUtf8(A.hwnd, title);
             lastHour = hour; lastDay = g_day; lastPaused = g_paused; lastEnc = g_encounter;
         }
