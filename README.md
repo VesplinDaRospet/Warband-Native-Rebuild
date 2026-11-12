@@ -10,7 +10,7 @@
 
 ## English
 
-A from-scratch C++/Vulkan renderer that reads original Mount&Blade: Warband assets and **does not depend on WSE2**.
+A from-scratch C++/Vulkan renderer that reads **user-provided** Mount&Blade: Warband assets and **does not depend on WSE2**.
 
 ### v0.1-static-render — minimal static-rendering loop ✅
 
@@ -70,6 +70,8 @@ Dependencies (not in this repo; obtain them yourself):
 ```sh
 g++ -std=c++20 -O2 src/vk_scene.cpp -o vk_scene.exe \
     -I <vulkan-headers>/include -luser32 -lgdi32
+g++ -std=c++20 -O2 src/vk_map.cpp -o vk_map.exe \
+    -I <vulkan-headers>/include -luser32 -lgdi32
 ```
 
 ### Run
@@ -89,7 +91,8 @@ Example paths are illustrative only; no official game files are bundled with thi
 
 - BRF: token stream `rfver `(i32) → texture/shader/material/mesh/skeleton/skeleton_anim/body → `end`;
   every object type is preceded by a u32 count; strings = u32 length + bytes.
-- BRF meshes face the XZ plane; render mapping is `x'=x, y'=z, z'=-y`.
+- BRF meshes face the XZ plane; standalone rendering maps `x'=x, y'=z, z'=-y`. Scene props additionally apply
+  the SCO placement matrix as `S·M·S` (swap y/z, multiply, swap back) with height kept positive.
 - SCO: magic i32 `-717`, version 4; object positions are stored on disk as (x, z, y).
 - SCO terrain layer index `0..10` matches the row order in `Data/ground_specs.txt` (gray_stone…path);
   `-7793` is the elevation float, `-12565` is vertex color. Terrain cell size is 2 m, grid origin (0,0).
@@ -102,9 +105,12 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 
 - [x] v0.1 static render: BRF/SCO/DDS parsing + Vulkan on screen + layered terrain texturing + directional light
 - [x] Skybox / fog / far clipping (skyboxes.brf dome + linear distance fog + zf=800)
-- [x] Character & camera controls (original `man_body` mesh + `skel_human` skeleton skinning + `man_walk` animation, CPU-skinned; WASD moves the character, arrow keys orbit, QE zooms, ground-snapped)
-- [x] Collision & pathfinding (SCO ai_mesh navmesh: 247 vertices / 422 edges / 173 faces; character constrained to walkable faces, slides along walls; G triggers A* pathfinding to the farthest walkable face)
-- [ ] Full original-scene experience
+- [x] Character & camera controls (original `man_body` mesh + `skel_human` skeleton skinning + stand/walk/run animations, CPU-skinned)
+- [x] v0.2-1 real prop collision: native `bo_*` collision bodies (sphere/capsule/manifold per-face), free player movement, vertical overlap filter
+- [x] v0.2-2 true terrain blending: single ground mesh with 3 weighted textures + leveling vertex colors
+- [x] v0.3 campaign map: `map.txt` renderer with terrain-coded texturing and click-to-move BFS pathfinding
+- [x] v0.4 map↔scene loop: settlement icons from `map_icons.txt`/`parties.txt`, click to enter the matching `.sco` scene, `M` returns to the map
+- [ ] Next: map party icons / scene interaction, then the TXT-module rewrite
 
 ### License
 
@@ -114,7 +120,7 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 
 ## 中文
 
-从原版 Mount&Blade: Warband 资源出发、**不依赖 WSE2** 的自研 C++/Vulkan 渲染器。
+从**用户自行提供的** Mount&Blade: Warband 资源出发、**不依赖 WSE2** 的自研 C++/Vulkan 渲染器。
 
 ## v0.1-static-render —— 静态渲染最小闭环 ✅
 
@@ -174,6 +180,8 @@ vk_map "<模组目录>\map.txt" "<游戏根目录>\Textures"
 ```sh
 g++ -std=c++20 -O2 src/vk_scene.cpp -o vk_scene.exe \
     -I <vulkan-headers>/include -luser32 -lgdi32
+g++ -std=c++20 -O2 src/vk_map.cpp -o vk_map.exe \
+    -I <vulkan-headers>/include -luser32 -lgdi32
 ```
 
 ## 运行
@@ -192,7 +200,8 @@ vk_scene.exe \
 
 - BRF：token 流 `rfver `(i32) → texture/shader/material/mesh/skeleton/skeleton_anim/body → `end`；
   每类对象先读 u32 数量；字符串 = u32 长度 + 字节。
-- BRF 网格正面在 XZ 平面；渲染坐标映射 `x'=x, y'=z, z'=-y`。
+- BRF 网格正面在 XZ 平面；独立渲染坐标映射 `x'=x, y'=z, z'=-y`。场景道具还会按
+  `S·M·S` 约定套用 SCO 摆放矩阵（先 y/z 互换、乘矩阵、再互换回来），高度保持正向。
 - SCO：魔数 i32 `-717`，version 4；物件 pos 磁盘序为 (x, z, y)。
 - SCO terrain 层 index `0..10` 对应 `Data/ground_specs.txt` 行序（gray_stone…path），
   `-7793` 是高程浮点，`-12565` 是顶点色。terrain cell 边长 2m，网格原点 (0,0)。
@@ -205,9 +214,12 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 
 - [x] v0.1 静态渲染：BRF/SCO/DDS 解析 + Vulkan 上屏 + 地形分层贴图 + 方向光
 - [x] 天空盒 / 雾 / 远裁剪（skyboxes.brf 穹顶 + 线性距离雾 + zf=800）
-- [x] 角色与相机操控（原版 `man_body` 模型 + `skel_human` 骨骼蒙皮 + `man_walk` 动画，CPU 蒙皮；WASD 走角色，方向键绕角色转头，QE 拉近拉远，贴地行走）
-- [x] 碰撞与寻路（SCO ai_mesh 导航网格：247 顶点/422 边/173 面；角色限走可走面、沿墙滑动；G 键 A* 自动寻路到最远可走面）
-- [ ] 完整原版场景体验
+- [x] 角色与相机操控（原版 `man_body` 模型 + `skel_human` 骨骼蒙皮 + 站/走/跑三档动画，CPU 蒙皮）
+- [x] v0.2-1 真墙体碰撞：原生 `bo_*` 碰撞体（球/胶囊/manifold 逐面），玩家自由行走，垂直重叠过滤
+- [x] v0.2-2 地形真混合：单地面网格三贴图加权混合 + leveling 顶点色
+- [x] v0.3 战役大地图：`map.txt` 渲染（按地形码贴图）+ 点击寻路（BFS）
+- [x] v0.4 地图↔场景闭环：`map_icons.txt`/`parties.txt` 定居点图标，点击进入对应 `.sco` 场景，按 `M` 回地图
+- [ ] 下一步：地图队伍图标 / 场景交互，之后是 TXT 模块重写
 
 ## 许可证
 
