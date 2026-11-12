@@ -71,7 +71,7 @@ struct App {
     VkPipeline pipeSky = VK_NULL_HANDLE;
     VkPipelineLayout groundPipeLayout = VK_NULL_HANDLE;
     VkPipeline pipeGround = VK_NULL_HANDLE;
-    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; bool ground=false; int charPart=-1; };
+    struct Obj { VkBuffer vb=VK_NULL_HANDLE, ib=VK_NULL_HANDLE; VkDeviceMemory vm=VK_NULL_HANDLE, im=VK_NULL_HANDLE; uint32_t idxCount=0; std::vector<float> pc; std::vector<float> model; int texSlot=0; VkDescriptorSet descSet=VK_NULL_HANDLE; std::string diffName="shields"; bool sky=false; bool charAnim=false; bool ground=false; int charPart=-1; int charGroup=-1; float tintR=1.f,tintG=1.f,tintB=1.f; };
     std::vector<Obj> objs;
     std::vector<VkImageView> texViews;
     std::vector<std::string> texNames;
@@ -562,6 +562,7 @@ static std::map<std::string, std::string> g_materialDiffuse;
 static sco::Terrain g_terrain;
 struct Char { float x=0, z=0, yaw=0.f; };
 static Char g_char;
+static std::vector<Char> g_chars;   // 战斗模式：g_chars[0]=玩家，后面是敌方 troops
 static sco::AiMesh g_aiMesh;
 // 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf / meshes_face_gen.brf）
 struct CharSkin {
@@ -708,17 +709,18 @@ static void logBlocked(const ColShape* s, float x, float z) {
         std::fprintf(stderr, "[撞] %s type=%d r=%.2f\n", buf, s->type, s->r);
     }
 }
-static void moveCharBlocked(float nx, float nz) {
+static void moveCharBlockedC(Char& c, float nx, float nz) {
     nx = clampToTerrain(nx, true); nz = clampToTerrain(nz, false);
-    if (freeAt(nx, nz)) { g_char.x=nx; g_char.z=nz; return; }
+    if (freeAt(nx, nz)) { c.x=nx; c.z=nz; return; }
     float foot = terrainHeightAt(nx, nz);
     const ColShape* hit = blockedByProps(nx, nz, foot, foot + 1.9f); logBlocked(hit, nx, nz);
-    if (freeAt(nx, g_char.z)) { g_char.x=nx; return; }
-    if (freeAt(g_char.x, nz)) { g_char.z=nz; return; }
+    if (freeAt(nx, c.z)) { c.x=nx; return; }
+    if (freeAt(c.x, nz)) { c.z=nz; return; }
 }
+static void moveCharBlocked(float nx, float nz) { moveCharBlockedC(g_char, nx, nz); }
 // 安全出生点：离首选点最近的、圆碰撞体不与任何 prop 盒相交的导航面中心
-static void safeSpawn(float preferX, float preferZ) {
-    if (!g_aiMesh.ok) { g_char.x = preferX; g_char.z = preferZ; return; }
+static void safeSpawnFor(Char& c, float preferX, float preferZ) {
+    if (!g_aiMesh.ok) { c.x = preferX; c.z = preferZ; return; }
     float bestD = 1e18f; bool found = false; float bx = preferX, bz = preferZ;
     for (auto& fc : g_aiMesh.faces) {
         float cx = 0, cz = 0; int n = 0;
@@ -729,8 +731,21 @@ static void safeSpawn(float preferX, float preferZ) {
         float d = (cx-preferX)*(cx-preferX) + (cz-preferZ)*(cz-preferZ);
         if (d < bestD) { bestD = d; bx = cx; bz = cz; found = true; }
     }
-    g_char.x = bx; g_char.z = bz;
+    c.x = bx; c.z = bz;
     if (!found) std::fprintf(stderr, "警告：没找到无 prop 的导航面，出生在 (%.1f,%.1f)\n", preferX, preferZ);
+}
+static void safeSpawn(float preferX, float preferZ) { safeSpawnFor(g_char, preferX, preferZ); }
+// 队伍站位：尽量按给的偏移精确站（不要导航面中心吸附，否则一大片人叠在同一点）
+static void spawnNear(Char& c, float preferX, float preferZ) {
+    if (freeAt(preferX, preferZ)) { c.x = preferX; c.z = preferZ; return; }
+    for (float r = 1.f; r <= 6.f; r += 1.f) {
+        for (int k = 0; k < 16; k++) {
+            float a = (float)k / 16.f * 6.2831853f;
+            float x = preferX + cosf(a)*r, z = preferZ + sinf(a)*r;
+            if (freeAt(x, z)) { c.x = x; c.z = z; return; }
+        }
+    }
+    safeSpawnFor(c, preferX, preferZ);
 }
 static void faceCenter(int32_t fi, float& x, float& z) {
     x=z=0; int n=0;
@@ -1308,10 +1323,21 @@ static void makeBoxCharObj(App& A) {
     std::fprintf(stderr, "占位角色 顶点=%zu 三角形=%zu\n", V.size()/11, I.size()/3);
 }
 static bool charTposeDebug() { static bool v = getenv("VK_TPOSE") != nullptr; return v; }
-static void makeCharObj(App& A, std::set<std::string>& needDds) {
-    if (!g_charSkin.ok) { makeBoxCharObj(A); return; }
+static void makeCharObj(App& A, std::set<std::string>& needDds, int group=0,
+                         float tintR=1.f, float tintG=1.f, float tintB=1.f) {
+    if (!g_charSkin.ok) {
+        makeBoxCharObj(A);
+        if (!A.objs.empty()) { A.objs.back().charGroup = group; A.objs.back().tintR=tintR; A.objs.back().tintG=tintG; A.objs.back().tintB=tintB; }
+        return;
+    }
     std::vector<std::vector<float>> V;
     buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
+    if (tintR != 1.f || tintG != 1.f || tintB != 1.f) { // 敌方部队顶点色染色，便于区分阵营
+        for (auto& part : V)
+            for (size_t i = 3; i + 7 < part.size(); i += 11) {
+                part[i] *= tintR; part[i+1] *= tintG; part[i+2] *= tintB;
+            }
+    }
     float mnx=1e9f,mny=1e9f,mnz=1e9f,mxx=-1e9f,mxy=-1e9f,mxz=-1e9f;
     for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
         const brf::Mesh& mesh = *g_charSkin.parts[pi].mesh;
@@ -1320,6 +1346,8 @@ static void makeCharObj(App& A, std::set<std::string>& needDds) {
         needDds.insert(obj.diffName);
         obj.charAnim = true;
         obj.charPart = (int)pi;
+        obj.charGroup = group;
+        obj.tintR = tintR; obj.tintG = tintG; obj.tintB = tintB;
         obj.model.assign(16, 0.f);
         makeBuffer(A, V[pi].size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
         upload(A, obj.vb, obj.vm, V[pi].data(), V[pi].size()*4);
@@ -1367,7 +1395,15 @@ static void updateCharAnim(App& A, float dt, bool moving) {
     buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     for (auto& o : A.objs) {
         if (!o.charAnim || o.charPart < 0 || (size_t)o.charPart >= V.size()) continue;
-        upload(A, o.vb, o.vm, V[o.charPart].data(), V[o.charPart].size()*4);
+        if (o.tintR == 1.f && o.tintG == 1.f && o.tintB == 1.f) {
+            upload(A, o.vb, o.vm, V[o.charPart].data(), V[o.charPart].size()*4);
+        } else {
+            std::vector<float> tv = V[o.charPart]; // 敌方染色副本（每队各自独立缓冲）
+            for (size_t i = 3; i + 7 < tv.size(); i += 11) {
+                tv[i] *= o.tintR; tv[i+1] *= o.tintG; tv[i+2] *= o.tintB;
+            }
+            upload(A, o.vb, o.vm, tv.data(), tv.size()*4);
+        }
     }
 }
 static void setCharModel(App::Obj& o, const Char& ch) {
@@ -1376,6 +1412,11 @@ static void setCharModel(App::Obj& o, const Char& ch) {
     // 列主序 model：先绕高度轴转 yaw，再平移（顶点已含 180° 修正）
     float M[16] = { cy, sy, 0, 0,  -sy, cy, 0, 0,  0,0,1,0,  ch.x, ch.z, h, 1 };
     o.model.assign(M, M+16);
+}
+// 战斗模式：charGroup 决定用哪个角色的位姿（0=玩家，1..N=敌方）
+static void setCharModelGrouped(App::Obj& o) {
+    if (o.charGroup >= 0 && (size_t)o.charGroup < g_chars.size()) setCharModel(o, g_chars[(size_t)o.charGroup]);
+    else setCharModel(o, g_char);
 }
 
 // 原版天空穹顶：skyboxes.brf 的单位球网格，放大到远平面内并跟随相机水平位置
@@ -1653,25 +1694,42 @@ static void sceneLaunchAndExit(const std::string& exeName, const std::string& ar
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0); setvbuf(stderr, nullptr, _IONBF, 0);
     SetUnhandledExceptionFilter(crashFilter);
-    if (argc < 5) { std::printf("usage: vk_scene <scene.sco> <scene_props.txt> <CommonRes目录> <Textures目录> [map.txt mapTextures fallbackTextures]\n"); return 1; }
+    if (argc < 5) { std::printf("usage: vk_scene <scene.sco> <scene_props.txt> <CommonRes目录> <Textures目录> [map.txt mapTextures fallbackTextures] | vk_scene --battle <同左...> <敌人数> [返回坐标x y]\n"); return 1; }
+    // 战斗模式：--battle <sco> <scene_props> <CommonRes> <module Textures> <map.txt> <root Textures> <fallback> <敌人数> [x y]
+    bool battle = (argc >= 2) && (std::string(argv[1]) == "--battle");
+    int a0 = battle ? 2 : 1;
+    if (argc < a0 + 4) { std::printf("参数不足\n"); return 1; }
+    int enemyCount = 0;
+    if (battle) enemyCount = (argc >= a0 + 8) ? atoi(argv[a0 + 7]) : 4;
     std::string mapReturnArgs;
-    if (argc >= 7) mapReturnArgs = "\"" + std::string(argv[5]) + "\" \"" + std::string(argv[6]) + "\"";
-    // vk_map 进城时会把队伍坐标放在 argv[8]/argv[9]，M 回地图时原样带回
-    if (argc >= 10) mapReturnArgs += " \"" + std::string(argv[8]) + "\" \"" + std::string(argv[9]) + "\"";
-    std::fprintf(stderr, "A: 解析场景 %s\n", argv[1]);
+    if (battle) {
+        if (argc >= a0 + 6) mapReturnArgs = "\"" + std::string(argv[a0+4]) + "\" \"" + std::string(argv[a0+5]) + "\"";
+        if (argc >= a0 + 10) mapReturnArgs += " \"" + std::string(argv[a0+8]) + "\" \"" + std::string(argv[a0+9]) + "\"";
+    } else {
+        if (argc >= 7) mapReturnArgs = "\"" + std::string(argv[5]) + "\" \"" + std::string(argv[6]) + "\"";
+        if (argc >= 10) mapReturnArgs += " \"" + std::string(argv[8]) + "\" \"" + std::string(argv[9]) + "\"";
+    }
+    std::fprintf(stderr, "A: 解析场景 %s%s\n", argv[a0], battle ? "（战斗模式）" : "");
     App A; A.hInst = GetModuleHandleA(nullptr);
     WNDCLASSA wc{}; wc.lpfnWndProc=wndProc; wc.hInstance=A.hInst; wc.lpszClassName="vkSceneWnd";
     RegisterClassA(&wc);
-    A.hwnd = CreateWindowA("vkSceneWnd", "M&B 原版场景自研渲染", WS_OVERLAPPEDWINDOW,
-                          200, 100, 1280, 720, nullptr, nullptr, A.hInst, nullptr);
+    A.hwnd = CreateWindowA("vkSceneWnd", battle ? "CV War 战斗场景自研渲染" : "M&B 原版场景自研渲染",
+                           WS_OVERLAPPEDWINDOW, 200, 100, 1280, 720, nullptr, nullptr, A.hInst, nullptr);
     std::fprintf(stderr, "C: initVk\n");
     initVk(A);
     float sceneCX=0, sceneCZ=0;
     std::set<std::string> needDds;
     std::fprintf(stderr, "E: 装配场景物件\n");
-    loadSceneAssets(A, argv[1], argv[2], argv[3], sceneCX, sceneCZ, needDds);
-    loadCharSkin(argv[3]);
-    makeCharObj(A, needDds);
+    loadSceneAssets(A, argv[a0], argv[a0+1], argv[a0+2], sceneCX, sceneCZ, needDds);
+    loadCharSkin(argv[a0+2]);
+    makeCharObj(A, needDds, 0); // 玩家（charGroup 0）
+    if (battle && enemyCount > 0) {
+        g_chars.resize((size_t)enemyCount + 1);
+        for (int e = 0; e < enemyCount; e++) {
+            float r = 0.25f + 0.04f * e; // 敌方偏红染色，方便区分阵营
+            makeCharObj(A, needDds, e + 1, 0.85f, r, r);
+        }
+    }
     if (getenv("VK_CHAR_ONLY")) { // 调试：只画角色，便于检查蒙皮姿态
         A.objs.erase(std::remove_if(A.objs.begin(), A.objs.end(),
             [](const App::Obj& o) { return !o.charAnim; }), A.objs.end());
@@ -1679,7 +1737,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> ddsNames(needDds.begin(), needDds.end());
     if (ddsNames.empty()) ddsNames.push_back("shields");
     std::fprintf(stderr, "C2: 加载 %zu 张贴图\n", ddsNames.size());
-    initTextures(A, argv[4], ddsNames, argc >= 8 ? argv[7] : "");
+    initTextures(A, argv[a0+3], ddsNames, argc >= a0 + 7 ? argv[a0+6] : "");
     std::fprintf(stderr, "D: initPipeline\n");
     initPipeline(A);
     for (auto& o : A.objs) {
@@ -1691,9 +1749,20 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "F: allocCmds\n");
     allocCmds(A);
     safeSpawn(sceneCX, sceneCZ);
+    if (battle) {
+        g_chars[0] = g_char; // 玩家
+        for (size_t e = 1; e < g_chars.size(); e++) {
+            float offX = -10.f + (float)(e - 1) * 4.f;              // 横向排开一列，正对镜头，避开与玩家重叠
+            float offZ = 0.f;
+            spawnNear(g_chars[e], g_char.x + offX, g_char.z + offZ);
+            float dx = g_char.x - g_chars[e].x, dz = g_char.z - g_chars[e].z;
+            g_chars[e].yaw = atan2f(-dx, dz); // 面向玩家（引擎朝向约定）
+        }
+        std::fprintf(stderr, "战斗：玩家 1 + 敌方 %d，场景布局用模组作者自己的\n", enemyCount);
+    }
     std::fprintf(stderr, "出生点 (%.1f,%.1f)（原中心 %.1f,%.1f）\n", g_char.x, g_char.z, sceneCX, sceneCZ);
     for (auto& o : A.objs) {
-        if (!o.model.empty()) setCharModel(o, g_char);
+        if (!o.model.empty()) setCharModelGrouped(o);
         if (o.ground) continue;
         auto ti = A.texIndex.find(o.diffName);
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
@@ -1744,6 +1813,14 @@ int main(int argc, char** argv) {
         vkWaitForFences(A.dev, 1, &A.fences[img], VK_TRUE, UINT64_MAX);
         vkResetFences(A.dev, 1, &A.fences[img]);
         bool moving = updatePlayer(cam, dt);
+        if (battle && !g_chars.empty()) {
+            g_chars[0] = g_char; // 玩家位姿同步给 charGroup 0
+            for (size_t e = 1; e < g_chars.size(); e++) { // v0.6-1：敌方列阵面向玩家，不移动（机制下一版）
+                Char& c = g_chars[e];
+                float dx = g_char.x - c.x, dz = g_char.z - c.z;
+                c.yaw = atan2f(-dx, dz);
+            }
+        }
         if (!mapReturnArgs.empty() && (GetAsyncKeyState('M') & 0x8000)) {
             std::fprintf(stderr, "M 返回大地图\n");
             sceneLaunchAndExit("vk_map.exe", mapReturnArgs);
@@ -1753,7 +1830,7 @@ int main(int argc, char** argv) {
             SetWindowTextA(A.hwnd, title.c_str());
         }
         updateCharAnim(A, dt, moving);
-        for (auto& o : A.objs) if (!o.model.empty()) setCharModel(o, g_char);
+        for (auto& o : A.objs) if (!o.model.empty()) setCharModelGrouped(o);
         playerFrame(g_char, cam, eye, tgt);
         updateAllMVP(A, eye, tgt);
         vkResetCommandBuffer(A.cmds[img], 0);

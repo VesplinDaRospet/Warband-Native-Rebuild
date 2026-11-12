@@ -812,6 +812,8 @@ static int g_pendingSettlement = -1;
 static size_t g_playerObjIdx = (size_t)-1; // 调试：VK_MAP_PLAYER_ONLY
 static std::string g_encounter;
 static std::string g_encounterPrev;
+static float g_battleTimer = 0.f;      // 遭遇后停留 1.5 秒自动进战斗
+static bool g_battleLaunched = false;
 static float g_hour = 6.f;      // 游戏时间：第 g_day 天 g_hour 时
 static int g_day = 1;
 
@@ -1165,6 +1167,22 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "进入 %s (%s，CV War 作者布局)\n", s.name.c_str(), s.scene.c_str());
         launchAndExit("vk_scene.exe", argline);
     };
+    // 遭遇野队 → 1.5 秒后进入 CV War 作者自己的战斗场景（v0.6-1）
+    auto enterBattle = [&]() {
+        std::string sco = moduleDir + "\\SceneObj\\scn_field_1.sco";
+        if (!std::filesystem::exists(sco)) sco = moduleDir + "\\SceneObj\\scn_quick_battle_1.sco";
+        if (!std::filesystem::exists(sco)) { std::fprintf(stderr, "没有可用战斗场景\n"); return; }
+        std::string argline =
+            "\"--battle\" \"" + sco + "\" \"" + moduleDir + "\\scene_props.txt\" \"" +
+            gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
+            std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
+            gameRoot + "\\Textures\"";
+        char tail[96];
+        std::snprintf(tail, sizeof(tail), " 5 %.2f %.2f", g_mx, g_my);
+        argline += tail;
+        std::fprintf(stderr, "[战斗] 进入 %s（CV War 作者布局，敌方 5 人）\n", sco.c_str());
+        launchAndExit("vk_scene.exe", argline);
+    };
     MSG msg;
     uint32_t frame=0;
     LARGE_INTEGER qf, lastQ;
@@ -1301,15 +1319,20 @@ int main(int argc, char** argv) {
                 ap.hold = true;
                 g_way.clear(); g_wayIdx = 0; g_pendingSettlement = -1;
                 setMarkerModel(mapObjs[markerIdx], g_mx, g_my, -999.f);
+                g_battleTimer += simDt;
             } else if (ap.hold && d2 > 4.84f) {
                 ap.hold = false; ap.wait = 1.5f;
             }
+        }
+        if (g_battleTimer >= 1.5f && !g_battleLaunched) {
+            g_battleLaunched = true;
+            enterBattle();
         }
         }
 
         if (g_encounter != g_encounterPrev) {
             if (!g_encounter.empty()) std::fprintf(stderr, "[遭遇] %s！\n", g_encounter.c_str());
-            else std::fprintf(stderr, "[离开] %s\n", g_encounterPrev.c_str());
+            else { std::fprintf(stderr, "[离开] %s\n", g_encounterPrev.c_str()); g_battleTimer = 0.f; g_battleLaunched = false; }
             g_encounterPrev = g_encounter;
         }
 
