@@ -141,7 +141,7 @@ static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const fl
     // 渲染坐标：x=世界x, y=世界z(南北), z=世界y(高度)；up=高度轴
     lookAt(V, eye[0], eye[1], eye[2], target[0], target[1], target[2]);
     perspective(P, 1.0f, 1280.0f/720.0f, 0.5f, 800.0f);
-    pc.resize(24, 0.f);
+    pc.resize(40, 0.f);
     if (model16) {
         std::vector<float> VM;
         matMul44(V.data(), model16, VM);
@@ -151,6 +151,9 @@ static void computeSceneMVP(std::vector<float>& pc, const float eye[3], const fl
     }
     pc[16] = eye[0]; pc[17] = eye[1]; pc[18] = eye[2];
     pc[20] = 70.f; pc[21] = 300.f;    // 雾起点/终点（世界距离）
+    // pc[24..39] = model 矩阵（雾距离用世界坐标；场景物件=单位矩阵）
+    if (model16) std::copy(model16, model16 + 16, pc.begin() + 24);
+    else { pc[24] = pc[29] = pc[34] = pc[39] = 1.f; }
 }
 
 static POINT g_click{-1,-1};   // 战斗模式：左键 = 攻击
@@ -469,7 +472,7 @@ static void initPipeline(App& A) {
     VkPipelineColorBlendAttachmentState cb{}; cb.colorWriteMask=0xF; cb.blendEnable=VK_FALSE;
     VkPipelineColorBlendStateCreateInfo cbs{}; cbs.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     cbs.attachmentCount=1; cbs.pAttachments=&cb;
-    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96};
+    VkPushConstantRange pc{VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 160};
     // descriptor set：binding 0 = combined image sampler
     VK_DEV_FN(A.dev, vkCreateDescriptorSetLayout); VK_DEV_FN(A.dev, vkCreateDescriptorPool);
     VK_DEV_FN(A.dev, vkAllocateDescriptorSets); VK_DEV_FN(A.dev, vkUpdateDescriptorSets);
@@ -629,6 +632,119 @@ struct CharSkin {
 };
 static CharSkin g_charSkin;
 // 肢体部件（小腿/手）约定：part x→骨+z，part y→骨-y（脚趾/掌心翻正），part z→骨+x（沿肢体长轴）
+// v0.7-3：敌方按野队名（party template name = troops plural）穿自己兵种的衣甲；武器暂共用 hatchet
+static std::vector<CharSkin::Part> g_enemyParts;
+static brf::BrfFile g_enemyArmorFile;
+static void loadEnemyGear(const std::string& propsPath, const std::string& commonRes, const std::string& partyName) {
+    if (partyName.empty() || partyName == "野队") { g_enemyParts.clear(); return; }
+    try {
+        std::filesystem::path moduleDir = std::filesystem::path(propsPath).parent_path();
+        // 1) troops.txt：找 plural == partyName 的兵种，读装备 item 编号
+        std::vector<int> eqItems;
+        {
+            std::ifstream f(moduleDir / "troops.txt");
+            std::string line; bool wantEq = false;
+            while (std::getline(f, line)) {
+                if (line.empty()) continue;
+                size_t p0 = line.find_first_not_of(" \t");
+                if (p0 == std::string::npos) continue;
+                line = line.substr(p0);
+                if (line.rfind("trp_", 0) == 0) {
+                    std::istringstream ss(line);
+                    std::string id, nm, pl;
+                    if (ss >> id >> nm >> pl) wantEq = (pl == partyName);
+                    continue;
+                }
+                if (wantEq && std::isdigit((unsigned char)line[0])) { // 紧跟主行的装备行
+                    std::istringstream ss(line);
+                    int a, b;
+                    while (ss >> a >> b) { if (a < 0) break; eqItems.push_back(a); }
+                    wantEq = false;
+                }
+            }
+        }
+        if (eqItems.empty()) { std::fprintf(stderr, "[兵种] 找不到 %s 的装备，敌方与玩家同款\n", partyName.c_str()); return; }
+        // 2) item_kinds1.txt：编号 → (mesh名, body_armor)
+        std::map<int, std::pair<std::string, int>> items;
+        {
+            std::ifstream f(moduleDir / "item_kinds1.txt");
+            std::string line; int no = 0;
+            while (std::getline(f, line)) {
+                size_t p0 = line.find_first_not_of(" \t\r\n");
+                if (p0 == std::string::npos) continue;
+                line = line.substr(p0);
+                if (line.rfind("itm_", 0) != 0) continue;
+                std::istringstream ss(line);
+                std::vector<std::string> t; std::string tok;
+                while (ss >> tok) t.push_back(tok);
+                if (t.size() < 8) { no++; continue; }
+                int mc = std::atoi(t[3].c_str());
+                size_t base = 4 + (size_t)mc * 2;
+                std::string mesh = (mc > 0) ? t[4] : "";
+                int body = 0;
+                if (t.size() >= base + 17) body = std::atoi(t[base + 7].c_str());
+                if (body > 0 && !mesh.empty()) items[no] = {mesh, body};
+                no++;
+            }
+        }
+        // 3) 选衣甲：body_armor 最高的 mesh 名
+        std::string armorMesh; int bestBody = 0;
+        for (int it : eqItems) {
+            auto it2 = items.find(it);
+            if (it2 != items.end() && it2->second.second > bestBody) { bestBody = it2->second.second; armorMesh = it2->second.first; }
+        }
+        if (armorMesh.empty()) { std::fprintf(stderr, "[兵种] %s 无衣甲 item，敌方与玩家同款\n", partyName.c_str()); return; }
+        // 4) 找网格：先模块 Resource 全扫，再去 CommonRes 找
+        brf::Mesh* armor = nullptr;
+        std::string lowerName; for (char c : armorMesh) lowerName += (char)std::tolower((unsigned char)c);
+        for (auto& p : std::filesystem::directory_iterator(moduleDir / "Resource")) {
+            if (p.path().extension() != ".brf") continue;
+            try {
+                g_enemyArmorFile = brf::parse(p.path().string());
+            } catch (...) { continue; }
+            for (auto& m : g_enemyArmorFile.meshes) {
+                std::string ln; for (char c : m.name) ln += (char)std::tolower((unsigned char)c);
+                if (ln == lowerName) { armor = &m; break; }
+            }
+            if (armor) break;
+        }
+        if (!armor) {
+            try {
+                g_enemyArmorFile = brf::parse(commonRes + "/costumes_b.brf");
+                for (auto& m : g_enemyArmorFile.meshes) {
+                    std::string ln; for (char c : m.name) ln += (char)std::tolower((unsigned char)c);
+                    if (ln == lowerName) { armor = &m; break; }
+                }
+            } catch (...) {}
+        }
+        if (!armor) { std::fprintf(stderr, "[兵种] 衣甲网格 %s 找不到，敌方与玩家同款\n", armorMesh.c_str()); return; }
+        for (auto& mt : g_enemyArmorFile.materials) // 衣甲所在 brf 的材料表并入全局（贴图名解析用）
+            if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
+        // 5) 敌方部件 = 玩家基础 6 部件 + 本兵种衣甲 + hatchet（复用玩家武器网格）
+        g_enemyParts.clear();
+        for (size_t i = 0; i < g_charSkin.parts.size(); i++) {
+            const auto& p = g_charSkin.parts[i];
+            if (p.mesh->name == "nobleman_outfit_b") continue; // 玩家护甲剔除
+            g_enemyParts.push_back(p); // body + 肢体 + 头 + hatchet 全保留
+        }
+        // 重新按序：先基础 body+肢体，再敌方衣甲，再武器
+        std::vector<CharSkin::Part> re;
+        for (auto& p : g_enemyParts) if (p.bone < 0 && p.mesh->name == "man_body") re.push_back(p);
+        for (auto& p : g_enemyParts) if (p.mesh->name != "man_body" && p.mesh->name != "hatchet") re.push_back(p);
+        auto wdiff = [&](const brf::Mesh* m, const std::string& fb) {
+            auto dit = g_materialDiffuse.find(m->material);
+            return (dit != g_materialDiffuse.end() && !dit->second.empty() && dit->second != "none") ? dit->second : fb;
+        };
+        re.push_back({armor, -1, wdiff(armor, g_charSkin.diffuse), false, false});
+        for (auto& p : g_enemyParts) if (p.mesh->name == "hatchet") re.push_back(p);
+        g_enemyParts = std::move(re);
+        std::fprintf(stderr, "[兵种] %s 衣甲=%s(防%d) 敌方部件=%zu\n", partyName.c_str(), armor->name.c_str(), bestBody, g_enemyParts.size());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[兵种] 装备解析失败: %s，敌方与玩家同款\n", e.what());
+        g_enemyParts.clear();
+    }
+}
+
 static skin::M44 g_partFixLimb = []() {
     skin::M44 m = skin::identity();
     m.m[0] = 0.f; m.m[1] = 0.f; m.m[2] = 1.f;   // col0=(0,0,1)
@@ -1310,8 +1426,8 @@ static void loadCharSkin(const std::string& commonRes) {
 }
 
 // 生成一帧全部部件的 11-float 渲染顶点（角色本地：前方 +y，脚底统一贴地 z≈0）
-static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) {
-    out.assign(g_charSkin.parts.size(), {});
+static void buildAllCharVerts(const std::vector<CharSkin::Part>& parts, std::vector<std::vector<float>>& out, bool tPose) {
+    out.assign(parts.size(), {});
     std::vector<skin::M44> ag, skm;
     if (!tPose) {
         const brf::AnimFrame& fr = (g_charSkin.attackAnim && g_charSkin.curAnim == g_charSkin.attackAnim)
@@ -1321,13 +1437,13 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
         skin::skinMatrices(g_charSkin.bind, ag, skm);
     }
     struct Staged { std::vector<brf::Vec3> pos, nrm; };
-    std::vector<Staged> st(g_charSkin.parts.size());
+    std::vector<Staged> st(parts.size());
     float minY = 1e9f;
-    for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
-        const brf::Mesh& m = *g_charSkin.parts[pi].mesh;
+    for (size_t pi = 0; pi < parts.size(); pi++) {
+        const brf::Mesh& m = *parts[pi].mesh;
         Staged& s = st[pi];
         s.nrm.resize(m.verts.size());
-        if (g_charSkin.parts[pi].bone < 0) {
+        if (parts[pi].bone < 0) {
             s.pos.resize(m.positions.size());
             for (size_t i = 0; i < m.positions.size(); i++) s.pos[i] = m.positions[i];
             if (!tPose) {
@@ -1338,11 +1454,11 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
                 for (size_t i = 0; i < m.verts.size(); i++) s.nrm[i] = m.verts[i].normal;
             }
         } else {
-            const skin::M44& fix = g_charSkin.parts[pi].fixSet ? g_charSkin.parts[pi].fix
-                                                              : (g_charSkin.parts[pi].isHead ? g_partFixHead : g_partFixLimb);
-            skin::M44 M = tPose ? skin::mul(g_charSkin.bind[g_charSkin.parts[pi].bone], fix)
-                                : skin::mul(ag[g_charSkin.parts[pi].bone], fix);
-            if (!g_charSkin.parts[pi].mirror) {
+            const skin::M44& fix = parts[pi].fixSet ? parts[pi].fix
+                                                   : (parts[pi].isHead ? g_partFixHead : g_partFixLimb);
+            skin::M44 M = tPose ? skin::mul(g_charSkin.bind[parts[pi].bone], fix)
+                                : skin::mul(ag[parts[pi].bone], fix);
+            if (!parts[pi].mirror) {
                 s.pos.resize(m.positions.size());
                 for (size_t i = 0; i < m.positions.size(); i++) { s.pos[i] = m.positions[i]; skin::xformPos(M, s.pos[i]); }
                 for (size_t i = 0; i < m.verts.size(); i++) {
@@ -1374,12 +1490,12 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
         }
         for (auto& p : s.pos) minY = std::min(minY, p.y);
     }
-    for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
-        const brf::Mesh& m = *g_charSkin.parts[pi].mesh;
+    for (size_t pi = 0; pi < parts.size(); pi++) {
+        const brf::Mesh& m = *parts[pi].mesh;
         Staged& s = st[pi];
         std::vector<float>& V = out[pi];
         V.clear();
-        size_t nHalf = g_charSkin.parts[pi].mirror ? 2u : 1u;
+        size_t nHalf = parts[pi].mirror ? 2u : 1u;
         V.reserve(m.verts.size() * 11 * nHalf);
         for (size_t h = 0; h < nHalf; h++) {
             for (size_t i = 0; i < m.verts.size(); i++) {
@@ -1428,19 +1544,21 @@ static void makeCharObj(App& A, std::set<std::string>& needDds, int group=0,
         if (!A.objs.empty()) { A.objs.back().charGroup = group; A.objs.back().tintR=tintR; A.objs.back().tintG=tintG; A.objs.back().tintB=tintB; }
         return;
     }
+    const std::vector<CharSkin::Part>& parts = (group > 0 && !g_enemyParts.empty()) ? g_enemyParts : g_charSkin.parts;
     std::vector<std::vector<float>> V;
-    buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
+    buildAllCharVerts(parts, V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
     if (tintR != 1.f || tintG != 1.f || tintB != 1.f) { // 敌方部队顶点色染色，便于区分阵营
         for (auto& part : V)
             for (size_t i = 3; i + 7 < part.size(); i += 11) {
                 part[i] *= tintR; part[i+1] *= tintG; part[i+2] *= tintB;
             }
+
     }
     float mnx=1e9f,mny=1e9f,mnz=1e9f,mxx=-1e9f,mxy=-1e9f,mxz=-1e9f;
-    for (size_t pi = 0; pi < g_charSkin.parts.size(); pi++) {
-        const brf::Mesh& mesh = *g_charSkin.parts[pi].mesh;
+    for (size_t pi = 0; pi < parts.size(); pi++) {
+        const brf::Mesh& mesh = *parts[pi].mesh;
         App::Obj obj;
-        obj.diffName = g_charSkin.parts[pi].diff;
+        obj.diffName = parts[pi].diff;
         needDds.insert(obj.diffName);
         obj.charAnim = true;
         obj.charPart = (int)pi;
@@ -1450,7 +1568,7 @@ static void makeCharObj(App& A, std::set<std::string>& needDds, int group=0,
         makeBuffer(A, V[pi].size()*4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, obj.vb, obj.vm);
         upload(A, obj.vb, obj.vm, V[pi].data(), V[pi].size()*4);
         std::vector<uint32_t> idxs;
-        if (g_charSkin.parts[pi].mirror) { // H(det=-1) 整体翻转绕序：base 半脸(-x)用原绕序，镜像半脸(+x)逆序
+        if (parts[pi].mirror) { // H(det=-1) 整体翻转绕序：base 半脸(-x)用原绕序，镜像半脸(+x)逆序
             uint32_t base = (uint32_t)(V[pi].size() / 22); // 原半边顶点数
             idxs.reserve(mesh.indices.size() * 2);
             for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
@@ -1474,8 +1592,8 @@ static void makeCharObj(App& A, std::set<std::string>& needDds, int group=0,
             mnz=std::min(mnz,V[pi][i+2]); mxz=std::max(mxz,V[pi][i+2]);
         }
     }
-    std::fprintf(stderr, "原版角色已上屏 部件=%zu bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
-        g_charSkin.parts.size(), mnx,mxx,mny,mxy,mnz,mxz);
+    std::fprintf(stderr, "角色部件上屏 部件=%zu bbox x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]\n",
+        parts.size(), mnx,mxx,mny,mxy,mnz,mxz);
 }
 static void updateCharAnim(App& A, float dt, bool moving) {
     if (!g_charSkin.ok) return;
@@ -1514,9 +1632,11 @@ static void updateCharAnim(App& A, float dt, bool moving) {
         g_charSkin.t = 0.f;
     }
     g_charSkin.frame = (size_t)g_charSkin.t % g_charSkin.curAnim->frames.size();
-    std::vector<std::vector<float>> V;
-    buildAllCharVerts(V, charTposeDebug()); // 正常走蒙皮；VK_TPOSE=1 调试时用 T-pose
+    std::vector<std::vector<float>> Vp, Ve;
+    buildAllCharVerts(g_charSkin.parts, Vp, charTposeDebug()); // 玩家部件顶点
+    buildAllCharVerts(g_enemyParts.empty() ? g_charSkin.parts : g_enemyParts, Ve, charTposeDebug()); // 敌方部件顶点
     for (auto& o : A.objs) {
+        const std::vector<std::vector<float>>& V = (o.charGroup > 0) ? Ve : Vp;
         if (!o.charAnim || o.charPart < 0 || (size_t)o.charPart >= V.size()) continue;
         float tr = o.tintR, tg = o.tintG, tb = o.tintB;
         if (o.charGroup > 0 && (size_t)o.charGroup < g_hitFlash.size() && g_hitFlash[(size_t)o.charGroup] > 0.f) {
@@ -1802,7 +1922,7 @@ static void recordCmdOne(App& A, size_t img) {
     for (auto& o : A.objs) {
         if (!o.sky) continue;
         vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, A.pipeLayout, 0, 1, &o.descSet, 0, nullptr);
-        vkCmdPushConstants(A.cmds[img], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
+        vkCmdPushConstants(A.cmds[img], A.pipeLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 160, o.pc.data());
         VkDeviceSize off=0;
         vkCmdBindVertexBuffers(A.cmds[img], 0, 1, &o.vb, &off);
         vkCmdBindIndexBuffer(A.cmds[img], o.ib, 0, VK_INDEX_TYPE_UINT32);
@@ -1816,7 +1936,7 @@ static void recordCmdOne(App& A, size_t img) {
         VkDescriptorSet desc = o.ground ? A.groundDescSet : o.descSet;
         vkCmdBindPipeline(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         vkCmdBindDescriptorSets(A.cmds[img], VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &desc, 0, nullptr);
-        vkCmdPushConstants(A.cmds[img], layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, o.pc.data());
+        vkCmdPushConstants(A.cmds[img], layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 160, o.pc.data());
         VkDeviceSize off=0;
         vkCmdBindVertexBuffers(A.cmds[img], 0, 1, &o.vb, &off);
         vkCmdBindIndexBuffer(A.cmds[img], o.ib, 0, VK_INDEX_TYPE_UINT32);
@@ -1878,12 +1998,13 @@ int main(int argc, char** argv) {
     loadWeaponStats(argv[a0+1]); // 判定数值从模块 item_kinds 来（v0.7 第 4 步）
     loadSceneAssets(A, argv[a0], argv[a0+1], argv[a0+2], sceneCX, sceneCZ, needDds);
     loadCharSkin(argv[a0+2]);
+    loadEnemyGear(argv[a0+1], argv[a0+2], g_battleName); // v0.7-3：敌方按野队兵种穿衣甲
     makeCharObj(A, needDds, 0); // 玩家（charGroup 0）
     if (battle && enemyCount > 0) {
         g_chars.resize((size_t)enemyCount + 1);
         for (int e = 0; e < enemyCount; e++) {
             float r = 0.25f + 0.04f * e; // 敌方偏红染色，方便区分阵营
-            makeCharObj(A, needDds, e + 1, 0.85f, r, r);
+            makeCharObj(A, needDds, e + 1, 0.95f, 0.28f, 0.28f); // 敌方染色：暗红（衣甲素色贴图 × 染色 = 敌我一眼区分）
         }
     }
     if (getenv("VK_CHAR_ONLY")) { // 调试：只画角色，便于检查蒙皮姿态
@@ -1901,6 +2022,7 @@ int main(int argc, char** argv) {
         auto ti = A.texIndex.find(o.diffName);
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
         o.descSet = A.texSets[o.texSlot];
+
     }
     std::fprintf(stderr, "F: allocCmds\n");
     allocCmds(A);
@@ -1927,6 +2049,7 @@ int main(int argc, char** argv) {
         auto ti = A.texIndex.find(o.diffName);
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
         o.descSet = A.texSets[o.texSlot];
+
     }
     Cam cam; // 第三人称相机：骑砍标准 = 角色背后（cam.yaw 与角色 yaw 同相，eye 偏移 = 前向量反向）
     cam.yaw = g_char.yaw + 3.14159265f; // 初始转到角色正后方；之前 yaw=0 相机在角色正前方，画面左右与角色左右镜面（一切“左右反”的根因）

@@ -9,6 +9,7 @@ layout(push_constant) uniform PC {
   mat4 mvp;
   vec4 eye;
   vec4 fog;
+  mat4 model;
 } pc;
 void main(){
   vec3 n = normalize(vNormal);
