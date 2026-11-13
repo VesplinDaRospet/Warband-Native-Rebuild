@@ -46,7 +46,9 @@ Game files such as `map.txt` and `.dds` textures are **not** distributed with th
 
 ### Battle scene / 战斗场景
 
-Touching an AI party on the map enters a battle scene from the module's own scene files (`vk_scene --battle`). The player and several enemy troops are rendered as separate character groups (enemies tinted red); enemies close in and strike back, and **left mouse click** attacks the nearest enemy inside a 2.6 m / ~100° hit cone. HP is tracked for both sides; when all enemies fall you win, when the player's HP reaches zero you lose, and either way the campaign map is relaunched with the result (and a defeated party disappears from the map).
+Touching an AI party on the map enters a battle scene from the module's own scene files (`vk_scene --battle`). The player and several enemy troops are rendered as separate character groups; enemies close in and strike back, and **left mouse click** attacks the nearest enemy inside the weapon's reach (read from the module's own item data: `weapon_length` + arm reach). HP is tracked for both sides; when all enemies fall you win, when the player's HP reaches zero you lose, and either way the campaign map is relaunched with the result (and a defeated party disappears from the map).
+
+Characters wear gear loaded from the game's own assets: a skinned armor mesh replaces/overlays the body part, and a rigid weapon mesh follows the hand bone. Attacking plays the game's own one-handed swing animation (`attacks_single_righttoleft`), blended in from the idle pose over 0.18 s, with the attack cooldown derived from the animation length and the weapon's `speed_rating`. All animation, model and texture assets are the user's own game files; this project ships only the loader and renderer code.
 
 ### Layout
 
@@ -59,6 +61,7 @@ Touching an AI party on the map enters a battle scene from the module's own scen
   - `vk_map.cpp` — campaign map renderer with click-to-move BFS pathfinding
   - `vk_mesh.cpp` — minimal single-mesh + texture validation program
   - `brf_dump / obj_export / dds_dump / sco_dump` — format validation tools
+  - `bone_dump / glob_bone / anim_dump / anim_probe` — skeleton / animation diagnostics (bone names, bind positions, animation frame listing)
   - `vk_probe.cpp` — Vulkan toolchain smoke test (dynamically loads vulkan-1.dll)
   - `tmp_terrain.cpp` / `tmp_test.cpp` — terrain-layer / BRF-parse diagnostics
   - `shot.ps1` — captures the vkSceneWnd window (`-OutDir` chooses the output folder, default `shots/`)
@@ -119,7 +122,9 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 - [x] v0.5 map party system: real-time player party movement, camera follow, game-time/pause HUD, AI patrol parties, encounter trigger, minimum-screen-size party/settlement badges
 - [x] v0.6-1 battle scene rendering: player + enemy troops in a module battle scene (`vk_scene --battle`), auto-entered from map encounters
 - [x] v0.6-2 basic combat mechanics: left-click attack with hit cone, enemies close in and strike back, HP tracking, deaths, win/lose returns to the campaign map with the result
-- [ ] Next: troop equipment/visuals from module data, then scene interaction (entries/doors) or the gameplay-logic rewrite
+- [x] v0.7-1 troop gear rendering: skinned armor mesh + rigid weapon mesh from the game's own assets, third-person camera behind the character
+- [x] v0.7-2 attack animation: the game's own `attacks_single_righttoleft` swing with a 0.18 s pose blend; combat reach and cooldown read from the module's own item data (`weapon_length`, `speed_rating`)
+- [ ] Next: per-troop equipment variation, damage/HP values from module data, multi-direction attacks, then scene interaction (entries/doors)
 
 ### License
 
@@ -237,6 +242,9 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 - [x] v0.5 地图队伍系统：玩家队伍实时行军、镜头跟随、游戏时间/暂停 HUD、AI 野队巡逻、遭遇触发、队伍/定居点最小屏占比图标
 - [x] v0.6-1 战斗场景渲染：玩家 + 敌方 troops 进入模组战斗场景（`vk_scene --battle`），地图遭遇后自动进入
 - [x] v0.6-2 基础战斗机制：左键攻击（扇区判定）、敌方逼近反击、血量、倒地、胜负回大地图并结算
+- [x] v0.7-1 兵种装备渲染：游戏自带蒙皮护甲网格 + 刚体武器网格挂手骨，第三人称相机在角色背后
+- [x] v0.7-2 攻击动画：游戏自带 `attacks_single_righttoleft` 挥砍 + 0.18 秒姿态混合；攻击距离与冷却读模块自身 item 数据（`weapon_length`、`speed_rating`）
+- [ ] 下一步：按兵种分配装备、伤害/血量读模块数据、多方向攻击，然后场景交互（入口/门）
 - [ ] 下一步：troops 装备/外观按模组数据装配，之后是场景交互（出入口/门）或玩法逻辑重写
 
 ## 许可证
