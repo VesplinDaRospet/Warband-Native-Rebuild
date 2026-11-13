@@ -571,7 +571,12 @@ static std::vector<Char> g_chars;   // 战斗模式：g_chars[0]=玩家，后面
 static float g_atkCd = 0.f;         // 玩家攻击冷却
 static float g_wpnLen = 60.f;       // 当前武器 weapon_length（cm，来自 item_kinds1.txt）
 static float g_wpnSpeed = 97.f;     // 当前武器 speed_rating
-static int   g_wpnSwing = 23;       // 当前武器 swing_damage（伤害还原留待玩法数值专项）
+static int   g_wpnSwing = 23;       // 当前武器 swing_damage（v0.7-6：攻击伤害原值直用）
+// v0.7-6：敌兵种数据（loadEnemyGear 从 troops/item_kinds 直读；判定数值一律来自模块数据）
+static float g_enemySwing = 23.f;   // 敌武器 swing_damage（选兵种 swing 最小的近战武器，避开 mod 神器件）
+static float g_enemyHp = 89.f;      // 敌 HP = 35 + 2*(str + ironflesh)（原版公式；CV War 数值膨胀故偏高）
+static int   g_playerHp = 100;      // 玩家 HP 占位：无模块兵种数据可读；手感不对时女王拍板调这里
+static int   g_lastMoveDir = 0;     // 攻击方向 = 最后移动方向：0=righttoleft 1=lefttoright 2=overswing 3=thrust
 // v0.7 第 4 步：判定数值从 CV War item_kinds 数据来，不用占位
 static void loadWeaponStats(const std::string& propsPath) {
     try {
@@ -605,7 +610,7 @@ static float g_endTimer = -1.f;     // 战斗结束后停留倒计时，-1=未�
 static std::string g_endResult;     // "胜" / "败"
 static std::string g_battleName = "野队";  // 遭遇的野队名，回地图时带回
 static std::vector<float> g_hitFlash;      // 每组受击闪红计时
-static brf::SkeletonAnim g_attackMirror;   // 攻击动画播放副本（根位移清零；素材原版数据在 attackFile 里不动）
+static brf::SkeletonAnim g_attackMirrors[4]; // 四向攻击动画播放副本（根位移清零；素材原版数据在 attackFile 里不动）
 static brf::AnimFrame g_mixFrame;          // 攻击起始混合帧（idle→攻击姿态 0.18s 过渡，防瞬移）
 static brf::AnimFrame g_attackBase;        // 攻击触发瞬间的姿态快照
 static bool g_battleFast() { static bool v = getenv("VK_BATTLE_FAST") != nullptr; return v; } // 速测：1 血敌方+血厚玩家
@@ -632,10 +637,29 @@ struct CharSkin {
 };
 static CharSkin g_charSkin;
 // 肢体部件（小腿/手）约定：part x→骨+z，part y→骨-y（脚趾/掌心翻正），part z→骨+x（沿肢体长轴）
-// v0.7-3：敌方按野队名（party template name = troops plural）穿自己兵种的衣甲；武器暂共用 hatchet
+// v0.7-3：敌方按野队名（party template name = troops plural）穿自己兵种的衣甲；v0.7-6 加本兵种武器
+static skin::M44 g_partFixLimb = []() {
+    skin::M44 m = skin::identity();
+    m.m[0] = 0.f; m.m[1] = 0.f; m.m[2] = 1.f;   // col0=(0,0,1)
+    m.m[4] = 0.f; m.m[5] = -1.f; m.m[6] = 0.f;  // col1=(0,-1,0)
+    m.m[8] = 1.f; m.m[9] = 0.f; m.m[10] = 0.f;  // col2=(1,0,0)
+    return m;
+}();
+static int g_attackDir = 0; // 攻击触发时锁存的方向（日志/后续机制用）
+static skin::M44 g_partFixWeapon = []() {
+    skin::M44 m = skin::identity();
+    m.m[0] = 1.f; m.m[1] = 0.f; m.m[2] = 0.f;   // part x(刃) → 骨+x（手指方向/前）
+    m.m[4] = 0.f; m.m[5] = 1.f; m.m[6] = 0.f;   // part y → 骨+y（正手：绕手指轴翻 180°，斧头转拇指侧）
+    m.m[8] = 0.f; m.m[9] = 0.f; m.m[10] = -1.f; // part z(斧柄) → 骨-z（横贯手掌）
+    m.m[12] = 0.07f;                            // 沿骨+x 平移到掌心（纯旋转会挂在手腕上）
+    return m;
+}();
 static std::vector<CharSkin::Part> g_enemyParts;
 static brf::BrfFile g_enemyArmorFile;
+static brf::BrfFile g_enemyWeaponFile;
+static brf::Mesh* g_enemyWeaponMesh = nullptr;
 static void loadEnemyGear(const std::string& propsPath, const std::string& commonRes, const std::string& partyName) {
+    g_enemyWeaponMesh = nullptr; g_enemySwing = 23.f; g_enemyHp = 89.f; // 每次进战斗重置
     if (partyName.empty() || partyName == "野队") { g_enemyParts.clear(); return; }
     try {
         std::filesystem::path moduleDir = std::filesystem::path(propsPath).parent_path();
@@ -643,7 +667,8 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
         std::vector<int> eqItems;
         {
             std::ifstream f(moduleDir / "troops.txt");
-            std::string line; bool wantEq = false;
+            std::string line; int afterEq = 0; // 0=等装备行 1=属性行(str agi int cha) 2=技能行(ironflesh 第一)
+            bool wantEq = false, got = false;
             while (std::getline(f, line)) {
                 if (line.empty()) continue;
                 size_t p0 = line.find_first_not_of(" \t");
@@ -652,20 +677,32 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
                 if (line.rfind("trp_", 0) == 0) {
                     std::istringstream ss(line);
                     std::string id, nm, pl;
-                    if (ss >> id >> nm >> pl) wantEq = (pl == partyName);
+                    if (ss >> id >> nm >> pl) wantEq = (!got && pl == partyName); // 取第一个同 plural 兵种（普通兵优先于 leader）
+                    afterEq = 0;
                     continue;
                 }
-                if (wantEq && std::isdigit((unsigned char)line[0])) { // 紧跟主行的装备行
+                if (wantEq && afterEq == 0 && std::isdigit((unsigned char)line[0])) { // 紧跟主行的装备行
                     std::istringstream ss(line);
                     int a, b;
                     while (ss >> a >> b) { if (a < 0) break; eqItems.push_back(a); }
-                    wantEq = false;
+                    wantEq = false; got = true; afterEq = 1;
+                    continue;
+                }
+                if (afterEq == 1 && std::isdigit((unsigned char)line[0])) { // 属性行：str 第一
+                    g_enemyHp = 35.f + 2.f * (float)std::atoi(line.c_str()); afterEq = 2;
+                    continue;
+                }
+                if (afterEq == 2 && std::isdigit((unsigned char)line[0])) { // 技能行：ironflesh 第一
+                    g_enemyHp += 2.f * (float)std::atoi(line.c_str()); afterEq = 0;
+                    std::fprintf(stderr, "[兵种] %s HP=%.0f（35+2*(str+ironflesh)，读 troops 属性/技能行）\n", partyName.c_str(), g_enemyHp);
+                    continue;
                 }
             }
         }
         if (eqItems.empty()) { std::fprintf(stderr, "[兵种] 找不到 %s 的装备，敌方与玩家同款\n", partyName.c_str()); return; }
-        // 2) item_kinds1.txt：编号 → (mesh名, body_armor)
-        std::map<int, std::pair<std::string, int>> items;
+        // 2) item_kinds1.txt：编号 → 网格名 + 尾字段（判定数值一律直读模块数据）
+        struct ItemInfo { std::string mesh; int body = 0, swing = 0, thrust = 0, speed = 0, wlen = 0; };
+        std::map<int, ItemInfo> items;
         {
             std::ifstream f(moduleDir / "item_kinds1.txt");
             std::string line; int no = 0;
@@ -680,10 +717,16 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
                 if (t.size() < 8) { no++; continue; }
                 int mc = std::atoi(t[3].c_str());
                 size_t base = 4 + (size_t)mc * 2;
-                std::string mesh = (mc > 0) ? t[4] : "";
-                int body = 0;
-                if (t.size() >= base + 17) body = std::atoi(t[base + 7].c_str());
-                if (body > 0 && !mesh.empty()) items[no] = {mesh, body};
+                if (t.size() >= base + 17) {
+                    ItemInfo inf;
+                    if (mc > 0) inf.mesh = t[4];
+                    inf.body = std::atoi(t[base + 7].c_str());
+                    inf.swing = std::atoi(t[base + 16].c_str());
+                    inf.thrust = std::atoi(t[base + 15].c_str());
+                    inf.speed = std::atoi(t[base + 11].c_str());
+                    inf.wlen = std::atoi(t[base + 13].c_str());
+                    if ((inf.body > 0 || inf.wlen > 0) && !inf.mesh.empty()) items[no] = inf;
+                }
                 no++;
             }
         }
@@ -691,7 +734,7 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
         std::string armorMesh; int bestBody = 0;
         for (int it : eqItems) {
             auto it2 = items.find(it);
-            if (it2 != items.end() && it2->second.second > bestBody) { bestBody = it2->second.second; armorMesh = it2->second.first; }
+            if (it2 != items.end() && it2->second.body > bestBody) { bestBody = it2->second.body; armorMesh = it2->second.mesh; }
         }
         if (armorMesh.empty()) { std::fprintf(stderr, "[兵种] %s 无衣甲 item，敌方与玩家同款\n", partyName.c_str()); return; }
         // 4) 找网格：先模块 Resource 全扫，再去 CommonRes 找
@@ -718,6 +761,43 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
             } catch (...) {}
         }
         if (!armor) { std::fprintf(stderr, "[兵种] 衣甲网格 %s 找不到，敌方与玩家同款\n", armorMesh.c_str()); return; }
+        // 4.5) 武器：本兵种 swing 最小的近战武器（swing>0 且 wlen>0；避开 mod 神器件：Looters→hatchet、Sea_Raiders→war_axe_b）
+        std::string wpnMesh; int bestSwing = 1 << 30;
+        for (int it : eqItems) {
+            auto it2 = items.find(it);
+            if (it2 != items.end() && it2->second.wlen > 0 && it2->second.swing > 0 && it2->second.swing < bestSwing) {
+                bestSwing = it2->second.swing; wpnMesh = it2->second.mesh;
+            }
+        }
+        if (!wpnMesh.empty()) {
+            g_enemySwing = (float)bestSwing;
+            std::string lowerW; for (char c : wpnMesh) lowerW += (char)std::tolower((unsigned char)c);
+            brf::Mesh* wpn = nullptr;
+            for (auto& p : std::filesystem::directory_iterator(moduleDir / "Resource")) {
+                if (p.path().extension() != ".brf") continue;
+                try { g_enemyWeaponFile = brf::parse(p.path().string()); } catch (...) { continue; }
+                for (auto& m : g_enemyWeaponFile.meshes) {
+                    std::string ln; for (char c : m.name) ln += (char)std::tolower((unsigned char)c);
+                    if (ln == lowerW) { wpn = &m; break; }
+                }
+                if (wpn) break;
+            }
+            if (!wpn) { // CommonRes 武器包兜底
+                try {
+                    g_enemyWeaponFile = brf::parse(commonRes + "/weapon_meshes1.brf");
+                    for (auto& m : g_enemyWeaponFile.meshes) {
+                        std::string ln; for (char c : m.name) ln += (char)std::tolower((unsigned char)c);
+                        if (ln == lowerW) { wpn = &m; break; }
+                    }
+                } catch (...) {}
+            }
+            if (wpn) {
+                g_enemyWeaponMesh = wpn;
+                for (auto& mt : g_enemyWeaponFile.materials) // 武器所在 brf 材料表并入全局（贴图名解析用）
+                    if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
+                std::fprintf(stderr, "[兵种] %s 武器=%s swing=%g（反击伤害原值）\n", partyName.c_str(), wpnMesh.c_str(), g_enemySwing);
+            } else std::fprintf(stderr, "[兵种] 武器网格 %s 找不到，敌方兜底 hatchet\n", wpnMesh.c_str());
+        } else std::fprintf(stderr, "[兵种] %s 无近战武器 item，敌方兜底 hatchet\n", partyName.c_str());
         for (auto& mt : g_enemyArmorFile.materials) // 衣甲所在 brf 的材料表并入全局（贴图名解析用）
             if (!g_materialDiffuse.count(mt.name)) g_materialDiffuse[mt.name] = mt.diffuseA;
         // 5) 敌方部件 = 玩家基础 6 部件 + 本兵种衣甲 + hatchet（复用玩家武器网格）
@@ -736,7 +816,18 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
             return (dit != g_materialDiffuse.end() && !dit->second.empty() && dit->second != "none") ? dit->second : fb;
         };
         re.push_back({armor, -1, wdiff(armor, g_charSkin.diffuse), false, false});
-        for (auto& p : g_enemyParts) if (p.mesh->name == "hatchet") re.push_back(p);
+        if (g_enemyWeaponMesh) { // v0.7-6：敌兵种武器挂 hand.R，与玩家 hatchet 同约定
+            int hr = -1;
+            if (g_charSkin.skel)
+                for (size_t bi = 0; bi < g_charSkin.skel->bones.size(); bi++)
+                    if (g_charSkin.skel->bones[bi].name == "hand.R") { hr = (int)bi; break; }
+            if (hr >= 0) {
+                CharSkin::Part w{g_enemyWeaponMesh, hr, wdiff(g_enemyWeaponMesh, "snow"), false, false};
+                w.fixSet = true; w.fix = g_partFixWeapon; // 武器专用握持：斧柄横贯手掌，刃朝前（与玩家同约定）
+                re.push_back(w);
+            } else std::fprintf(stderr, "[兵种] hand.R 骨找不到，敌方武器跳过\n");
+        }
+        if (!g_enemyWeaponMesh) for (auto& p : g_enemyParts) if (p.mesh->name == "hatchet") re.push_back(p); // 兜底：玩家同款 hatchet
         g_enemyParts = std::move(re);
         std::fprintf(stderr, "[兵种] %s 衣甲=%s(防%d) 敌方部件=%zu\n", partyName.c_str(), armor->name.c_str(), bestBody, g_enemyParts.size());
     } catch (const std::exception& e) {
@@ -745,13 +836,6 @@ static void loadEnemyGear(const std::string& propsPath, const std::string& commo
     }
 }
 
-static skin::M44 g_partFixLimb = []() {
-    skin::M44 m = skin::identity();
-    m.m[0] = 0.f; m.m[1] = 0.f; m.m[2] = 1.f;   // col0=(0,0,1)
-    m.m[4] = 0.f; m.m[5] = -1.f; m.m[6] = 0.f;  // col1=(0,-1,0)
-    m.m[8] = 1.f; m.m[9] = 0.f; m.m[10] = 0.f;  // col2=(1,0,0)
-    return m;
-}();
 // 头部约定（male_head 是半脸网格，z=朝上、y=脸正前方、x=半宽）：
 // part x→骨-z（世界左侧），part y→骨-y（世界 +z 脸），part z→骨+x（世界 +y 头顶）
 static skin::M44 g_partFixHead = []() {
@@ -985,8 +1069,10 @@ static void playerFrame(const Char& ch, const Cam& cam, float eye[3], float targ
 static bool updatePlayer(Cam& cam, float dt) {
     float sx=0, sz=0, dy=0, dp=0, dd=0;
     auto k = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-    if (k('W')) sz += 1; if (k('S')) sz -= 1;
-    if (k('D')) sx += 1; if (k('A')) sx -= 1;
+    if (k('W')) { sz += 1; g_lastMoveDir = 2; }   // 前→上劈（骑砍手感：攻击方向=最后移动方向）
+    if (k('S')) { sz -= 1; g_lastMoveDir = 3; }   // 后→刺
+    if (k('D')) { sx += 1; g_lastMoveDir = 0; }   // 右→righttoleft（画面从右往左挥）
+    if (k('A')) { sx -= 1; g_lastMoveDir = 1; }   // 左→lefttoright
     if (k(VK_LEFT)) dy += 1; if (k(VK_RIGHT)) dy -= 1;
     if (k(VK_UP)) dp += 1; if (k(VK_DOWN)) dp -= 1;
     if (k('E')) dd -= 1; if (k('Q')) dd += 1;   // QE 拉近/拉远相机
@@ -1387,25 +1473,31 @@ static void loadCharSkin(const std::string& commonRes) {
             int hr = boneIdx("hand.R"); // 相机已在角色背后（画面右=角色右），BRF 语义恢复：右手武器挂 hand.R
             if (wpn && hr >= 0) {
                 CharSkin::Part wp{wpn, hr, diffFor(wpn->material, "snow"), false, false};
-                wp.fixSet = true; wp.fix = g_partFixLimb; // 与手部件同约定：part x→骨+z, y→骨-y, z→骨+x（刀身沿手指方向）
+                wp.fixSet = true; wp.fix = g_partFixWeapon; // 武器专用握持：斧柄横贯手掌，刃朝前（与手部件约定分开）
                 g_charSkin.parts.push_back(wp);
             } else std::fprintf(stderr, "缺武器网格 hatchet 或 hand.R 骨，跳过\n");
         } catch (const std::exception& e) {
             std::fprintf(stderr, "装备加载失败: %s（继续跑）\n", e.what());
         }
-        // 攻击动画（CV War 原版素材；hatchet 单手挥砍 → attacks_single_righttoleft）
+        // 攻击动画四向（CV War 原版素材；方向 = 最后移动方向，静止默认 righttoleft）
         try {
             g_charSkin.attackFile = brf::parse(commonRes + "/ani_attacks.brf");
-            for (auto& a : g_charSkin.attackFile.anims)
-                if (a.name == "attacks_single_righttoleft") { g_charSkin.attackAnim = &a; break; }
-            if (!g_charSkin.attackAnim) std::fprintf(stderr, "缺攻击动画 attacks_single_righttoleft，攻击不播动画\n");
-            else {
-                g_attackMirror = *g_charSkin.attackAnim;   // 用副本播放：根位移清零，素材数据不动
-                for (auto& fr : g_attackMirror.frames) fr.tra = {0.f, 0.f, 0.f};
-                g_charSkin.attackAnim = &g_attackMirror;
-                std::fprintf(stderr, "攻击动画: attacks_single_righttoleft (%zu 帧，原样播放，根位移清零)\n",
-                             g_charSkin.attackAnim->frames.size());
+            static const char* kAtk[4] = {
+                "attacks_single_righttoleft", "attacks_single_lefttoright",
+                "attacks_single_overswing", "attacks_thrust_onehanded" };
+            for (int d = 0; d < 4; d++) {
+                for (auto& a : g_charSkin.attackFile.anims)
+                    if (a.name == kAtk[d]) {
+                        g_attackMirrors[d] = a;   // 副本播放：根位移清零，素材数据不动
+                        for (auto& fr : g_attackMirrors[d].frames) fr.tra = {0.f, 0.f, 0.f};
+                        break;
+                    }
+                if (g_attackMirrors[d].frames.empty())
+                    std::fprintf(stderr, "缺攻击动画 %s，该方向退化为默认\n", kAtk[d]);
+                else
+                    std::fprintf(stderr, "攻击动画[%d]=%s (%zu 帧，根位移清零)\n", d, kAtk[d], g_attackMirrors[d].frames.size());
             }
+            g_charSkin.attackAnim = g_attackMirrors[0].frames.empty() ? nullptr : &g_attackMirrors[0];
         } catch (const std::exception& e) {
             std::fprintf(stderr, "攻击动画加载失败: %s（继续跑）\n", e.what());
         }
@@ -1426,13 +1518,14 @@ static void loadCharSkin(const std::string& commonRes) {
 }
 
 // 生成一帧全部部件的 11-float 渲染顶点（角色本地：前方 +y，脚底统一贴地 z≈0）
-static void buildAllCharVerts(const std::vector<CharSkin::Part>& parts, std::vector<std::vector<float>>& out, bool tPose) {
+static void buildAllCharVerts(const std::vector<CharSkin::Part>& parts, std::vector<std::vector<float>>& out, bool tPose, const brf::AnimFrame* forced = nullptr) {
     out.assign(parts.size(), {});
     std::vector<skin::M44> ag, skm;
     if (!tPose) {
-        const brf::AnimFrame& fr = (g_charSkin.attackAnim && g_charSkin.curAnim == g_charSkin.attackAnim)
-            ? g_mixFrame
-            : g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()];
+        const brf::AnimFrame& fr = forced ? *forced
+            : ((g_charSkin.attackAnim && g_charSkin.curAnim == g_charSkin.attackAnim)
+                ? g_mixFrame
+                : g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()]);
         skin::animGlobals(*g_charSkin.skel, fr, ag);
         skin::skinMatrices(g_charSkin.bind, ag, skm);
     }
@@ -1633,8 +1726,11 @@ static void updateCharAnim(App& A, float dt, bool moving) {
     }
     g_charSkin.frame = (size_t)g_charSkin.t % g_charSkin.curAnim->frames.size();
     std::vector<std::vector<float>> Vp, Ve;
-    buildAllCharVerts(g_charSkin.parts, Vp, charTposeDebug()); // 玩家部件顶点
-    buildAllCharVerts(g_enemyParts.empty() ? g_charSkin.parts : g_enemyParts, Ve, charTposeDebug()); // 敌方部件顶点
+    buildAllCharVerts(g_charSkin.parts, Vp, charTposeDebug(), nullptr); // 玩家部件顶点（武器握持 fix 已含刃朝向，攻击不另翻转）
+    // 敌方永远站姿，不跟玩家动画走（此前共用 curAnim：玩家挥刀敌人也挥、玩家跑步敌人也跑，斧头握持乱的真凶）
+    const brf::AnimFrame* enemyFr = (g_charSkin.standAnim && !g_charSkin.standAnim->frames.empty())
+                                   ? &g_charSkin.standAnim->frames[0] : nullptr;
+    buildAllCharVerts(g_enemyParts.empty() ? g_charSkin.parts : g_enemyParts, Ve, charTposeDebug(), enemyFr); // 敌方部件顶点
     for (auto& o : A.objs) {
         const std::vector<std::vector<float>>& V = (o.charGroup > 0) ? Ve : Vp;
         if (!o.charAnim || o.charPart < 0 || (size_t)o.charPart >= V.size()) continue;
@@ -2029,14 +2125,14 @@ int main(int argc, char** argv) {
     safeSpawn(sceneCX, sceneCZ);
     if (battle) {
         g_chars[0] = g_char; // 玩家
-        g_chars[0].hp = g_battleFast() ? 999.f : 8.f;
+        g_chars[0].hp = g_battleFast() ? 999.f : (float)g_playerHp; // v0.7-6：占位（无模块兵种数据），值见 g_playerHp
         for (size_t e = 1; e < g_chars.size(); e++) {
             float offX = -10.f + (float)(e - 1) * 4.f;              // 横向排开一列，正对镜头，避开与玩家重叠
             float offZ = 0.f;
             spawnNear(g_chars[e], g_char.x + offX, g_char.z + offZ);
             float dx = g_char.x - g_chars[e].x, dz = g_char.z - g_chars[e].z;
             g_chars[e].yaw = atan2f(-dx, dz); // 面向玩家（引擎朝向约定）
-            g_chars[e].hp = g_battleFast() ? 1.f : 4.f;
+            g_chars[e].hp = g_battleFast() ? 1.f : g_enemyHp; // 35+2*(str+ironflesh)，读本兵种 troops
             g_chars[e].atkCd = 1.5f + (float)(e % 3) * 0.5f;
         }
         g_hitFlash.assign(g_chars.size(), 0.f);
@@ -2111,8 +2207,8 @@ int main(int argc, char** argv) {
                     moveCharBlockedC(c, c.x + dx/dist*step, c.z + dz/dist*step);
                 } else if (g_endTimer < 0.f && c.atkCd <= 0.f) { // 近身攻击玩家（战斗结束即停手）
                     c.atkCd = 2.0f;
-                    g_chars[0].hp -= 1.f;
-                    std::fprintf(stderr, "[被击] 玩家 HP %.0f\n", g_chars[0].hp);
+                    g_chars[0].hp -= g_enemySwing; // 反击伤害 = 敌兵种武器 swing 原值（item_kinds 数据）
+                    std::fprintf(stderr, "[被击] -%g 玩家 HP %.0f\n", g_enemySwing, g_chars[0].hp);
                 }
                 if (c.atkCd > 0.f) c.atkCd -= dt;
                 if (g_hitFlash[e] > 0.f) g_hitFlash[e] -= dt;
@@ -2121,8 +2217,15 @@ int main(int argc, char** argv) {
             if (g_click.x >= 0) {
                 g_click.x = -1; g_click.y = -1;
                 if (g_atkCd <= 0.f) {
+                    // 攻击方向 = 最后移动方向（0 右挥 1 左挥 2 上劈 3 刺；静止默认右挥）
+                    if (!g_attackMirrors[g_lastMoveDir].frames.empty())
+                        g_charSkin.attackAnim = &g_attackMirrors[g_lastMoveDir];
+                    else g_charSkin.attackAnim = &g_attackMirrors[0];
+                    g_attackDir = g_lastMoveDir; // 锁存：攻击中走位不改变本次攻击方向
+                    static const char* kDirName[4] = {"righttoleft", "lefttoright", "overswing", "thrust"};
+                    std::fprintf(stderr, "[挥击] 方向=%s\n", kDirName[g_lastMoveDir]);
                     // 冷却 = 攻击动画时长 / (speed_rating/100)，与 CV War 攻速数据一致
-                    float clipLen = (g_charSkin.attackAnim ? (float)g_charSkin.attackAnim->frames.size() / 30.f : 0.5f);
+                    float clipLen = (float)g_charSkin.attackAnim->frames.size() / 30.f;
                     g_atkCd = clipLen / std::max(20.f, g_wpnSpeed) * 100.f;
                     g_attackT = 0.f; // 挥刀动画（命中/挥空都挥，与骑砍手感一致）
                     g_attackBase = g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()];
@@ -2139,9 +2242,9 @@ int main(int argc, char** argv) {
                         if (ang < bestA) { bestA = ang; best = (int)e; }
                     }
                     if (best > 0) {
-                        g_chars[(size_t)best].hp -= 2.f;
+                        g_chars[(size_t)best].hp -= (float)g_wpnSwing; // 伤害 = 玩家武器 swing 原值（item_kinds 数据）
                         g_hitFlash[(size_t)best] = 0.25f;
-                        std::fprintf(stderr, "[击中] %s 组%d 剩 HP %.0f\n", g_battleName.c_str(), best, g_chars[(size_t)best].hp);
+                        std::fprintf(stderr, "[击中] %s 组%d -%d 剩 HP %.0f\n", g_battleName.c_str(), best, g_wpnSwing, g_chars[(size_t)best].hp);
                         if (g_chars[(size_t)best].hp <= 0.f) {
                             g_chars[(size_t)best].alive = false;
                             std::fprintf(stderr, "[击倒] %s 组%d\n", g_battleName.c_str(), best);

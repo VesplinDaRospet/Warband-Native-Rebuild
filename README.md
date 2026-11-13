@@ -124,7 +124,11 @@ cmpxchg8b forum documentation, cuellius/ScoTools. The parsers in this repo are i
 - [x] v0.6-2 basic combat mechanics: left-click attack with hit cone, enemies close in and strike back, HP tracking, deaths, win/lose returns to the campaign map with the result
 - [x] v0.7-1 troop gear rendering: skinned armor mesh + rigid weapon mesh from the game's own assets, third-person camera behind the character
 - [x] v0.7-2 attack animation: the game's own `attacks_single_righttoleft` swing with a 0.18 s pose blend; combat reach and cooldown read from the module's own item data (`weapon_length`, `speed_rating`)
-- [ ] Next: per-troop equipment variation, damage/HP values from module data, multi-direction attacks, then scene interaction (entries/doors)
+- [x] v0.7-3 per-party armor: each enemy party wears its own faction armor rendered from module resources
+- [x] v0.7-4 data-driven combat values: attack damage and hit points now come from the module's own data instead of placeholders
+- [x] v0.7-5 fog fix: per-object model matrix in the push constant, characters shaded in world space (no more washed-out fog on characters)
+- [x] v0.7-6 per-party weapons + four attack directions: each party picks its own melee weapon; swing damage drives both sides; attack direction (righttoleft/lefttoright/overswing/thrust) follows the last movement direction; weapon grip corrected (handle across the palm, blade forward); enemy animation decoupled from the player
+- [ ] Next: scene interaction (entries/doors), then gameplay-logic rewrite
 
 ### License
 
@@ -244,8 +248,11 @@ cmpxchg8b 论坛文档、cuellius/ScoTools。本仓库解析器为独立实现�
 - [x] v0.6-2 基础战斗机制：左键攻击（扇区判定）、敌方逼近反击、血量、倒地、胜负回大地图并结算
 - [x] v0.7-1 兵种装备渲染：游戏自带蒙皮护甲网格 + 刚体武器网格挂手骨，第三人称相机在角色背后
 - [x] v0.7-2 攻击动画：游戏自带 `attacks_single_righttoleft` 挥砍 + 0.18 秒姿态混合；攻击距离与冷却读模块自身 item 数据（`weapon_length`、`speed_rating`）
-- [ ] 下一步：按兵种分配装备、伤害/血量读模块数据、多方向攻击，然后场景交互（入口/门）
-- [ ] 下一步：troops 装备/外观按模组数据装配，之后是场景交互（出入口/门）或玩法逻辑重写
+- [x] v0.7-3 按兵种衣甲：各野队穿自己兵种的护甲（网格从模块资源解析渲染）
+- [x] v0.7-4 判定数值读模块数据：攻击伤害与血量来自模块自身数据，替换占位值
+- [x] v0.7-5 雾修复：push constant 增加逐物件 model 矩阵，角色按世界坐标雾距着色（角色不再糊成雾色）
+- [x] v0.7-6 按兵种武器 + 四向攻击：各野队拿自己的近战武器；伤害按武器数据；攻击方向（右挥/左挥/上劈/刺）跟随最后移动方向；武器握持修正（斧柄横贯掌心、刃朝前）；敌方动画与玩家解耦
+- [ ] 下一步：场景交互（入口/门），然后玩法逻辑重写
 
 ## 许可证
 
