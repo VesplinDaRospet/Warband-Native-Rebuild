@@ -622,21 +622,40 @@ static void buildMapObjs(App& A, const MapData& md, std::vector<MapObj>& objs) {
 }
 
 // 地图图标：把 moe_map_icons.brf 的网格平铺在地图平面上（x'=x*s, y'=z*s）
-static bool loadIconMeshes(const std::string& moduleDir, std::map<std::string, brf::Mesh>& meshes) {
+static bool loadIconMeshes(const std::string& moduleDir, const std::string& commonResDir, std::map<std::string, brf::Mesh>& meshes) {
     try {
-        brf::BrfFile bf = brf::parse(moduleDir + "\\Resource\\moe_map_icons.brf");
-        for (auto& m : bf.meshes) meshes[m.name] = std::move(m);
+        std::string path = moduleDir + "\\Resource\\moe_map_icons.brf";
+        if (std::filesystem::exists(path)) {
+            // 第三方 mod 惯例：作者归并的图标网格文件
+            brf::BrfFile bf = brf::parse(path);
+            for (auto& m : bf.meshes) meshes[m.name] = std::move(m);
+        } else {
+            // 原版风格 mod（如 Native）：图标网格散在根 CommonRes 的几个 brf 里
+            static const char* files[] = { "map_icon_meshes.brf", "map_icons_b.brf", "map_icons_c.brf" };
+            for (auto& f : files) {
+                std::string p = commonResDir + "\\" + f;
+                if (!std::filesystem::exists(p)) continue;
+                brf::BrfFile bf = brf::parse(p);
+                for (auto& m : bf.meshes) meshes[m.name] = std::move(m);
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "图标 brf 解析失败: %s\n", e.what());
         return false;
     }
 }
+static size_t makeBadgeObj(App& A, VkDescriptorSet desc, float r, float g, float b,
+                           float radius, float x, float y, float z, std::vector<MapObj>& objs);
 static size_t makeIconObj(App& A, const std::map<std::string, brf::Mesh>& meshes,
                           VkDescriptorSet desc, const std::string& meshName, float scale,
                           float x, float y, float z, std::vector<MapObj>& objs) {
     auto it = meshes.find(meshName);
-    if (it == meshes.end()) { std::fprintf(stderr, "缺图标网格 %s\n", meshName.c_str()); return SIZE_MAX; }
+    if (it == meshes.end()) {
+        // 降级容错：坏资产不消失，画品红徽标占位（一眼可见的坏数据标记）
+        std::fprintf(stderr, "缺图标网格 %s，用品红徽标占位\n", meshName.c_str());
+        return makeBadgeObj(A, desc, 1.f, 0.f, 1.f, 3.f, x, y, z, objs);
+    }
     auto& m = it->second;
     std::vector<float> verts; std::vector<uint32_t> idx;
     verts.reserve(m.verts.size()*11);
@@ -1017,30 +1036,82 @@ static LONG WINAPI mapCrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// engine_config.json（可选）：环境事实走配置，拒绝硬编码；命令行参数优先
+struct EngCfg { std::string gameRoot, defaultModule; int windowW = 1280, windowH = 720; };
+static std::string jstr(const std::string& s, const char* k, std::string d = {}) {
+    auto p = s.find(std::string("\"") + k + "\""); if (p == s.npos) return d;
+    p = s.find(':', p); if (p == s.npos) return d; p = s.find('"', p); if (p == s.npos) return d;
+    auto e = s.find('"', p + 1); if (e == s.npos) return d; std::string v;
+    for (auto i = p + 1; i < e; ++i) {
+        if (s[i] == '\\' && i + 1 < e) { char c = s[++i]; if (c == 'n') v += '\n'; else if (c == 't') v += '\t'; else v += c; }
+        else v += s[i];
+    }
+    return v;
+}
+static int jint(const std::string& s, const char* k, int d) {
+    auto p = s.find(std::string("\"") + k + "\""); if (p == s.npos) return d;
+    p = s.find(':', p); if (p == s.npos) return d; char* e = nullptr;
+    long v = std::strtol(s.c_str() + p + 1, &e, 10); return e == s.c_str() + p + 1 ? d : (int)v;
+}
+static EngCfg loadCfg() {
+    EngCfg c;
+    std::filesystem::path ed;
+    wchar_t b[32768]; DWORD n = GetModuleFileNameW(nullptr, b, 32768);
+    if (n) ed = std::filesystem::path(b).parent_path();
+    if (ed.empty()) ed = std::filesystem::current_path();
+    std::filesystem::path ps[2] = { ed / "engine_config.json", std::filesystem::current_path() / "engine_config.json" };
+    for (auto& p : ps) {
+        std::error_code ec;
+        if (!std::filesystem::exists(p, ec)) continue;
+        std::ifstream f(p, std::ios::binary);
+        if (!f) return c;
+        std::ostringstream ss; ss << f.rdbuf(); auto s = ss.str();
+        c.gameRoot = jstr(s, "game_root"); c.defaultModule = jstr(s, "default_module");
+        c.windowW = jint(s, "window_w", 1280); c.windowH = jint(s, "window_h", 720);
+        break;
+    }
+    return c;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0); setvbuf(stderr, nullptr, _IONBF, 0);
     SetUnhandledExceptionFilter(mapCrashFilter);
-    if (argc < 3) { std::printf("usage: vk_map <map.txt> <Textures目录>\n"); return 1; }
+    EngCfg cfg = loadCfg();
+    std::string mapArg, texArg;
+    if (argc >= 3) { mapArg = argv[1]; texArg = argv[2]; }
+    else {
+        std::string mod = (argc == 2) ? argv[1] : cfg.defaultModule;
+        if (mod.empty()) { std::printf("usage: vk_map <map.txt> <Textures目录> | vk_map <mod名> | vk_map(无参=default_module)\n"); return 1; }
+        if (cfg.gameRoot.empty()) { std::printf("缺少 engine_config.json 的 game_root\n"); return 1; }
+        std::filesystem::path root(cfg.gameRoot), md = root / "Modules" / mod;
+        if (!std::filesystem::is_directory(md)) { std::printf("mod 目录不存在: %s\n", md.string().c_str()); return 1; }
+        mapArg = (md / "map.txt").string();
+        texArg = (root / "Textures").string();
+    }
     App A;
     A.hInst = GetModuleHandleA(nullptr);
     WNDCLASSA wc{}; wc.lpfnWndProc=wndProc; wc.hInstance=A.hInst; wc.lpszClassName="vkMapWnd";
     RegisterClassA(&wc);
     A.hwnd = CreateWindowExA(0, "vkMapWnd", "CV War Campaign Map (loading)",
-        WS_OVERLAPPEDWINDOW|WS_VISIBLE, 120, 60, 1280, 720, nullptr, nullptr, A.hInst, nullptr);
+        WS_OVERLAPPEDWINDOW|WS_VISIBLE, 120, 60, cfg.windowW, cfg.windowH, nullptr, nullptr, A.hInst, nullptr);
     if (!A.hwnd) { std::printf("FAIL 建窗\n"); return 1; }
     setTitleUtf8(A.hwnd, "CV War 大地图 | WASD行军 点击寻路/进城 空格暂停 QE缩放 方向键视角 ESC退出");
     initVk(A);
 
     MapData md;
-    try { md = loadMap(argv[1]); }
+    try { md = loadMap(mapArg); }
     catch (const std::exception& e) { std::fprintf(stderr, "地图加载失败: %s\n", e.what()); return 1; }
-    std::filesystem::path mapPath(argv[1]);
+    std::filesystem::path mapPath(mapArg);
     std::string moduleDir = mapPath.parent_path().string();          // Modules\CV War
     std::string gameRoot = mapPath.parent_path().parent_path().parent_path().string(); // 游戏根
-    auto icons = loadMapIcons(moduleDir);
-    auto templates = loadPartyTemplates(moduleDir);
-    auto partyRecs = loadParties(moduleDir);
-    auto settlements = loadSettlements(partyRecs);
+    auto icons = std::vector<IconDef>{};
+    auto templates = std::vector<TemplateDef>{};
+    auto partyRecs = std::vector<PartyRec>{};
+    auto settlements = std::vector<Settlement>{};
+    try { icons = loadMapIcons(moduleDir); } catch (const std::exception& e) { std::fprintf(stderr, "[容错] map_icons 解析失败（空表继续）: %s\n", e.what()); }
+    try { templates = loadPartyTemplates(moduleDir); } catch (const std::exception& e) { std::fprintf(stderr, "[容错] party_templates 解析失败（空表继续）: %s\n", e.what()); }
+    try { partyRecs = loadParties(moduleDir); } catch (const std::exception& e) { std::fprintf(stderr, "[容错] parties 解析失败（空表继续）: %s\n", e.what()); }
+    try { settlements = loadSettlements(partyRecs); } catch (const std::exception& e) { std::fprintf(stderr, "[容错] 定居点解析失败（空表继续）: %s\n", e.what()); }
     std::fprintf(stderr, "map_icons %zu 个 / parties %zu 条 / 定居点 %zu 个（module=%s）\n",
                  icons.size(), partyRecs.size(), settlements.size(), moduleDir.c_str());
     std::set<std::string> texNames;
@@ -1050,13 +1121,13 @@ int main(int argc, char** argv) {
     std::vector<std::string> names(texNames.begin(), texNames.end());
     std::fprintf(stderr, "地图 %zu 顶点 范围 x[%.0f..%.0f] y[%.0f..%.0f]\n",
         md.pos.size(), md.minX, md.maxX, md.minY, md.maxY);
-    initTextures(A, argv[2], names);
+    initTextures(A, texArg, names);
     initMapPipeline(A);
     std::vector<MapObj> mapObjs;
     buildMapObjs(A, md, mapObjs);
 
     std::map<std::string, brf::Mesh> iconMeshes;
-    loadIconMeshes(moduleDir, iconMeshes);
+    loadIconMeshes(moduleDir, gameRoot + "\\CommonRes", iconMeshes);
     auto ti = A.texIndex.find("fake_houses");
     VkDescriptorSet iconDesc = A.texSets[ti != A.texIndex.end() ? ti->second : 0];
     auto tw = A.texIndex.find("white");
@@ -1176,7 +1247,7 @@ int main(int argc, char** argv) {
         std::string argline =
             "\"" + sco + "\" \"" + moduleDir + "\\scene_props.txt\" \"" +
             gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
-            std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
+            mapArg + "\" \"" + texArg + "\" \"" +
             gameRoot + "\\Textures\"";
         char posbuf[64];
         std::snprintf(posbuf, sizeof(posbuf), " %.2f %.2f", g_mx, g_my);
@@ -1192,7 +1263,7 @@ int main(int argc, char** argv) {
         std::string argline =
             "\"--battle\" \"" + sco + "\" \"" + moduleDir + "\\scene_props.txt\" \"" +
             gameRoot + "\\CommonRes\" \"" + moduleDir + "\\Textures\" \"" +
-            std::string(argv[1]) + "\" \"" + std::string(argv[2]) + "\" \"" +
+            mapArg + "\" \"" + texArg + "\" \"" +
             gameRoot + "\\Textures\"";
         char tail[160];
         const char* nm = g_encounter.empty() ? "野队" : g_encounter.c_str();
