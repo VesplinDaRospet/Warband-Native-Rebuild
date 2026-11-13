@@ -566,16 +566,52 @@ struct Char { float x=0, z=0, yaw=0.f; float hp=8.f, atkCd=0.f; bool alive=true;
 static Char g_char;
 static std::vector<Char> g_chars;   // 战斗模式：g_chars[0]=玩家，后面是敌方 troops
 static float g_atkCd = 0.f;         // 玩家攻击冷却
+static float g_wpnLen = 60.f;       // 当前武器 weapon_length（cm，来自 item_kinds1.txt）
+static float g_wpnSpeed = 97.f;     // 当前武器 speed_rating
+static int   g_wpnSwing = 23;       // 当前武器 swing_damage（伤害还原留待玩法数值专项）
+// v0.7 第 4 步：判定数值从 CV War item_kinds 数据来，不用占位
+static void loadWeaponStats(const std::string& propsPath) {
+    try {
+        std::filesystem::path moduleDir = std::filesystem::path(propsPath).parent_path();
+        std::ifstream f(moduleDir / "item_kinds1.txt");
+        if (!f) { std::fprintf(stderr, "[判定] 找不到 item_kinds1.txt，用占位数值\n"); return; }
+        std::string line;
+        while (std::getline(f, line)) {
+            size_t p0 = line.find_first_not_of(" \t\r\n");
+            if (p0 == std::string::npos) continue;
+            line = line.substr(p0); // item_kinds 行首有前导空格
+            if (line.rfind("itm_hatchet ", 0) != 0) continue;
+            std::istringstream ss(line);
+            std::vector<std::string> t; std::string tok;
+            while (ss >> tok) t.push_back(tok);
+            if (t.size() < 8) break;
+            int mc = std::atoi(t[3].c_str());
+            size_t base = 4 + (size_t)mc * 2;
+            if (t.size() >= base + 17) {
+                g_wpnSpeed = (float)std::atof(t[base + 11].c_str());
+                g_wpnLen   = (float)std::atof(t[base + 13].c_str());
+                g_wpnSwing = std::atoi(t[base + 16].c_str());
+                std::fprintf(stderr, "[判定] hatchet: wlen=%g speed=%g swing=%d\n", g_wpnLen, g_wpnSpeed, g_wpnSwing);
+            }
+            break;
+        }
+    } catch (...) { std::fprintf(stderr, "[判定] item 解析失败，用占位数值\n"); }
+}
+static float g_attackT = -1.f;      // 攻击动画播放进度（帧计数），-1=未播放；素材=CV War 原版 ani_attacks
 static float g_endTimer = -1.f;     // 战斗结束后停留倒计时，-1=未结束
 static std::string g_endResult;     // "胜" / "败"
 static std::string g_battleName = "野队";  // 遭遇的野队名，回地图时带回
 static std::vector<float> g_hitFlash;      // 每组受击闪红计时
+static brf::SkeletonAnim g_attackMirror;   // 攻击动画播放副本（根位移清零；素材原版数据在 attackFile 里不动）
+static brf::AnimFrame g_mixFrame;          // 攻击起始混合帧（idle→攻击姿态 0.18s 过渡，防瞬移）
+static brf::AnimFrame g_attackBase;        // 攻击触发瞬间的姿态快照
 static bool g_battleFast() { static bool v = getenv("VK_BATTLE_FAST") != nullptr; return v; } // 速测：1 血敌方+血厚玩家
 static sco::AiMesh g_aiMesh;
 // 原版角色蒙皮资源（skeletons.brf / ani_man_walk.brf / body_meshes.brf / meshes_face_gen.brf）
 struct CharSkin {
     bool ok = false;
-    brf::BrfFile skelFile, animFile, bodyFile, faceFile, standFile, runFile;
+    brf::BrfFile skelFile, animFile, bodyFile, faceFile, standFile, runFile, armorFile, weaponFile, attackFile;
+    brf::SkeletonAnim* attackAnim = nullptr;   // 攻击动画（ani_attacks.brf，CV War 原版；相机在背后=画面右=角色右，原样播即可）
     brf::Skeleton* skel = nullptr;
     brf::SkeletonAnim* anim = nullptr;      // man_walk（走路）
     brf::SkeletonAnim* standAnim = nullptr; // stand_man（静止）
@@ -583,7 +619,8 @@ struct CharSkin {
     brf::SkeletonAnim* curAnim = nullptr;
     brf::Mesh* body = nullptr;
     // 部件列表：0=body 蒙皮；其余为无蒙皮的附属部件，整体跟随 bone（骨骼全局 × 固定旋转）
-    struct Part { const brf::Mesh* mesh = nullptr; int bone = -1; std::string diff = "snow"; bool mirror = false; bool isHead = false; };
+    struct Part { const brf::Mesh* mesh = nullptr; int bone = -1; std::string diff = "snow"; bool mirror = false; bool isHead = false;
+                  bool fixSet = false; skin::M44 fix = skin::identity(); };
     std::vector<Part> parts;
     std::vector<skin::M44> bind;
     float t = 0.f;
@@ -1220,6 +1257,42 @@ static void loadCharSkin(const std::string& commonRes) {
         addPart(g_charSkin.bodyFile.meshes, "m_handL", "hand.L", g_charSkin.diffuse);
         addPart(g_charSkin.bodyFile.meshes, "m_handR", "hand.R", g_charSkin.diffuse);
         addPart(g_charSkin.faceFile.meshes, "male_head", "head", "manface_young", true, true); // 头网格是半脸，引擎镜像补全
+        // v0.7 装备（素材全用游戏自带）：护甲=蒙皮网格（bone=-1 走蒙皮），武器=刚体网格挂右手骨
+        try {
+            g_charSkin.armorFile = brf::parse(commonRes + "/costumes_b.brf");
+            brf::Mesh* armor = nullptr;
+            for (auto& m : g_charSkin.armorFile.meshes) if (m.name == "nobleman_outfit_b") { armor = &m; break; }
+            if (armor) {
+                g_charSkin.parts.push_back({armor, -1, diffFor(armor->material, g_charSkin.diffuse), false, false});
+            } else std::fprintf(stderr, "缺护甲网格 nobleman_outfit_b，跳过（不影响运行）\n");
+            g_charSkin.weaponFile = brf::parse(commonRes + "/weapon_meshes1.brf");
+            brf::Mesh* wpn = nullptr;
+            for (auto& m : g_charSkin.weaponFile.meshes) if (m.name == "hatchet") { wpn = &m; break; }
+            int hr = boneIdx("hand.R"); // 相机已在角色背后（画面右=角色右），BRF 语义恢复：右手武器挂 hand.R
+            if (wpn && hr >= 0) {
+                CharSkin::Part wp{wpn, hr, diffFor(wpn->material, "snow"), false, false};
+                wp.fixSet = true; wp.fix = g_partFixLimb; // 与手部件同约定：part x→骨+z, y→骨-y, z→骨+x（刀身沿手指方向）
+                g_charSkin.parts.push_back(wp);
+            } else std::fprintf(stderr, "缺武器网格 hatchet 或 hand.R 骨，跳过\n");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "装备加载失败: %s（继续跑）\n", e.what());
+        }
+        // 攻击动画（CV War 原版素材；hatchet 单手挥砍 → attacks_single_righttoleft）
+        try {
+            g_charSkin.attackFile = brf::parse(commonRes + "/ani_attacks.brf");
+            for (auto& a : g_charSkin.attackFile.anims)
+                if (a.name == "attacks_single_righttoleft") { g_charSkin.attackAnim = &a; break; }
+            if (!g_charSkin.attackAnim) std::fprintf(stderr, "缺攻击动画 attacks_single_righttoleft，攻击不播动画\n");
+            else {
+                g_attackMirror = *g_charSkin.attackAnim;   // 用副本播放：根位移清零，素材数据不动
+                for (auto& fr : g_attackMirror.frames) fr.tra = {0.f, 0.f, 0.f};
+                g_charSkin.attackAnim = &g_attackMirror;
+                std::fprintf(stderr, "攻击动画: attacks_single_righttoleft (%zu 帧，原样播放，根位移清零)\n",
+                             g_charSkin.attackAnim->frames.size());
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "攻击动画加载失败: %s（继续跑）\n", e.what());
+        }
         g_charSkin.ok = true;
         std::fprintf(stderr, "原版角色: %s(%zu骨) stand=%s(%zu帧) walk=%s(%zu帧) run=%s(%zu帧) 部件%zu: ",
             g_charSkin.skel->name.c_str(), g_charSkin.skel->bones.size(),
@@ -1241,7 +1314,9 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
     out.assign(g_charSkin.parts.size(), {});
     std::vector<skin::M44> ag, skm;
     if (!tPose) {
-        const brf::AnimFrame& fr = g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()];
+        const brf::AnimFrame& fr = (g_charSkin.attackAnim && g_charSkin.curAnim == g_charSkin.attackAnim)
+            ? g_mixFrame
+            : g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()];
         skin::animGlobals(*g_charSkin.skel, fr, ag);
         skin::skinMatrices(g_charSkin.bind, ag, skm);
     }
@@ -1263,7 +1338,8 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
                 for (size_t i = 0; i < m.verts.size(); i++) s.nrm[i] = m.verts[i].normal;
             }
         } else {
-            const skin::M44& fix = g_charSkin.parts[pi].isHead ? g_partFixHead : g_partFixLimb;
+            const skin::M44& fix = g_charSkin.parts[pi].fixSet ? g_charSkin.parts[pi].fix
+                                                              : (g_charSkin.parts[pi].isHead ? g_partFixHead : g_partFixLimb);
             skin::M44 M = tPose ? skin::mul(g_charSkin.bind[g_charSkin.parts[pi].bone], fix)
                                 : skin::mul(ag[g_charSkin.parts[pi].bone], fix);
             if (!g_charSkin.parts[pi].mirror) {
@@ -1312,10 +1388,10 @@ static void buildAllCharVerts(std::vector<std::vector<float>>& out, bool tPose) 
                 brf::Vec3& p = s.pos[h * m.positions.size() + idx];
                 brf::Vec3 n = (h * m.verts.size() + i < s.nrm.size()) ? s.nrm[h * m.verts.size() + i]
                                                                       : brf::Vec3{0.f, 0.f, 1.f};
-                V.push_back(p.x); V.push_back(p.z); V.push_back(p.y - minY);
+                V.push_back(-p.x); V.push_back(p.z); V.push_back(p.y - minY); // x 翻负：渲染输出与蒙皮坐标反号（女王 W/S 基准实测锁定）
                 uint32_t c = m.verts[i].color;
                 V.push_back(((c)&0xFF)/255.f); V.push_back(((c>>8)&0xFF)/255.f); V.push_back(((c>>16)&0xFF)/255.f);
-                V.push_back(n.x); V.push_back(n.z); V.push_back(n.y);
+                V.push_back(-n.x); V.push_back(n.z); V.push_back(n.y);
                 V.push_back(m.verts[i].uv.u); V.push_back(m.verts[i].uv.v);
             }
         }
@@ -1404,9 +1480,34 @@ static void makeCharObj(App& A, std::set<std::string>& needDds, int group=0,
 static void updateCharAnim(App& A, float dt, bool moving) {
     if (!g_charSkin.ok) return;
     bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-    brf::SkeletonAnim* want = moving ? (shift ? g_charSkin.runAnim : g_charSkin.anim) : g_charSkin.standAnim;
+    bool attacking = g_attackT >= 0.f && g_charSkin.attackAnim != nullptr;
+    brf::SkeletonAnim* want = attacking ? g_charSkin.attackAnim
+                            : (moving ? (shift ? g_charSkin.runAnim : g_charSkin.anim) : g_charSkin.standAnim);
     if (want != g_charSkin.curAnim) { g_charSkin.curAnim = want; g_charSkin.t = 0.f; }
-    if (moving) {
+    if (attacking) {
+        g_attackT += dt * 30.f; // 30fps 采样（与原版动画帧率一致）
+        if ((size_t)g_attackT >= g_charSkin.attackAnim->frames.size()) g_attackT = -1.f; // 播完回 idle
+        g_charSkin.t = std::max(0.f, g_attackT);
+        if (g_attackT >= 0.f) {
+            const brf::AnimFrame& fr = g_charSkin.attackAnim->frames[(size_t)g_attackT % g_charSkin.attackAnim->frames.size()];
+            g_mixFrame = fr;
+            float k = std::min(1.f, g_attackT / (30.f * 0.18f)); // 起手 0.18s 从当前姿态混合到攻击姿态（防瞬移）
+            if (k < 1.f) {
+                size_t n = std::min(fr.rots.size(), g_attackBase.rots.size());
+                for (size_t i = 0; i < n; i++) {
+                    brf::Quat a = g_attackBase.rots[i], b = fr.rots[i];
+                    float d = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+                    if (d < 0.f) { b.x=-b.x; b.y=-b.y; b.z=-b.z; b.w=-b.w; } // 半球一致
+                    brf::Quat q;
+                    q.x = a.x + (b.x - a.x)*k; q.y = a.y + (b.y - a.y)*k;
+                    q.z = a.z + (b.z - a.z)*k; q.w = a.w + (b.w - a.w)*k;
+                    float l = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+                    if (l > 1e-6f) { q.x/=l; q.y/=l; q.z/=l; q.w/=l; }
+                    g_mixFrame.rots[i] = q;
+                }
+            }
+        }
+    } else if (moving) {
         float speed = shift ? 1.9f : 1.0f; // run 比 walk 快；stand 不播放（静止停 frame0）
         g_charSkin.t += dt * 30.f * speed;
     } else {
@@ -1615,7 +1716,33 @@ static void loadSceneAssets(App& A, const std::string& scoPath, const std::strin
         auto it = sprMesh.find(o.id);
         if (it==sprMesh.end()) continue;
         auto git = g_meshGroups.find(it->second);
-        if (git==g_meshGroups.end()) { std::fprintf(stderr, "缺网格 %s (spr %u)\n", it->second.c_str(), o.id); continue; }
+        if (git==g_meshGroups.end()) {
+            // 降级容错：缺网格用品红替代块渲染（坏资产可视化，不闪退、不隐身）
+            std::fprintf(stderr, "缺网格 %s (spr %u)，用品红替代块\n", it->second.c_str(), o.id);
+            static brf::Mesh missing = []() {
+                brf::Mesh m;
+                m.name = "@missing"; m.material = "none";
+                const float c[8][3] = {{-1,-1,-1},{1,-1,-1},{1,1,-1},{-1,1,-1},
+                                       {-1,-1,1},{1,-1,1},{1,1,1},{-1,1,1}};
+                for (auto& p : c) m.positions.push_back({p[0],p[1],p[2]});
+                const int faces[12][3] = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{1,2,6},{1,6,5},
+                                          {0,4,7},{0,7,3},{3,7,6},{3,6,2},{0,1,5},{0,5,4}};
+                for (int fi = 0; fi < 12; fi++) {
+                    for (int vi = 0; vi < 3; vi++) {
+                        brf::Vertex vt;
+                        vt.index = faces[fi][vi];
+                        vt.color = 0xFFFF00FF; // AABBGGRR 品红
+                        vt.normal = {0,0,1};
+                        m.verts.push_back(vt);
+                        m.indices.push_back((uint32_t)(fi*3+vi));
+                    }
+                }
+                return m;
+            }();
+            uint32_t boxIdx = (uint32_t)(&o - scene.objects.data());
+            makeSceneObj(A, missing, o, sceneCX, sceneCZ, boxIdx, "0");
+            continue;
+        }
         for (auto& piece : git->second) {
             auto dit2 = g_materialDiffuse.find(piece.material);
             if (dit2 != g_materialDiffuse.end() && !dit2->second.empty() && dit2->second != "none") needDds.insert(dit2->second);
@@ -1748,6 +1875,7 @@ int main(int argc, char** argv) {
     float sceneCX=0, sceneCZ=0;
     std::set<std::string> needDds;
     std::fprintf(stderr, "E: 装配场景物件\n");
+    loadWeaponStats(argv[a0+1]); // 判定数值从模块 item_kinds 来（v0.7 第 4 步）
     loadSceneAssets(A, argv[a0], argv[a0+1], argv[a0+2], sceneCX, sceneCZ, needDds);
     loadCharSkin(argv[a0+2]);
     makeCharObj(A, needDds, 0); // 玩家（charGroup 0）
@@ -1800,7 +1928,8 @@ int main(int argc, char** argv) {
         o.texSlot = (ti != A.texIndex.end()) ? ti->second : 0;
         o.descSet = A.texSets[o.texSlot];
     }
-    Cam cam; // 第三人称相机：初始在角色北侧
+    Cam cam; // 第三人称相机：骑砍标准 = 角色背后（cam.yaw 与角色 yaw 同相，eye 偏移 = 前向量反向）
+    cam.yaw = g_char.yaw + 3.14159265f; // 初始转到角色正后方；之前 yaw=0 相机在角色正前方，画面左右与角色左右镜面（一切“左右反”的根因）
     cam.dist = 10.f; cam.height = 8.f; // 初始拉高一点，避免被近处建筑挡住角色
     float eye[3], tgt[3];
     playerFrame(g_char, cam, eye, tgt);
@@ -1869,14 +1998,18 @@ int main(int argc, char** argv) {
             if (g_click.x >= 0) {
                 g_click.x = -1; g_click.y = -1;
                 if (g_atkCd <= 0.f) {
-                    g_atkCd = 0.5f;
+                    // 冷却 = 攻击动画时长 / (speed_rating/100)，与 CV War 攻速数据一致
+                    float clipLen = (g_charSkin.attackAnim ? (float)g_charSkin.attackAnim->frames.size() / 30.f : 0.5f);
+                    g_atkCd = clipLen / std::max(20.f, g_wpnSpeed) * 100.f;
+                    g_attackT = 0.f; // 挥刀动画（命中/挥空都挥，与骑砍手感一致）
+                    g_attackBase = g_charSkin.curAnim->frames[g_charSkin.frame % g_charSkin.curAnim->frames.size()];
                     float fx = -sinf(g_char.yaw), fz = cosf(g_char.yaw);
                     int best = -1; float bestA = 1e9f;
                     for (size_t e = 1; e < g_chars.size(); e++) {
                         if (!g_chars[e].alive) continue;
                         float ex = g_chars[e].x - g_char.x, ez = g_chars[e].z - g_char.z;
                         float d = sqrtf(ex*ex + ez*ez);
-                        if (d > 2.6f) continue;
+                        if (d > g_wpnLen / 100.f + 1.0f) continue; // 攻击距离 = 武器长度(m) + 臂展 1m，来自 item 数据
                         float dot = (ex*fx + ez*fz) / d;
                         if (dot < -0.2f) continue; // 约 101° 扇区，两侧近身的也能砍到
                         float ang = acosf(std::min(1.f, std::max(-1.f, dot)));
